@@ -1,22 +1,39 @@
-#  AlphaMetrics — Financial Intelligence & Market Risk Engine
+# AlphaMetrics Financial Intelligence Engine
 
-AlphaMetrics is a high-throughput, low-latency asynchronous microservice built with **FastAPI** to deliver real-time financial market metrics, risk modeling, and technical momentum indicators.
+A real-time financial analytics backend, quantitative risk terminal, and containerized API built with Python, FastAPI, and Pandas. The system ingests live market data to compute technical indicators, including 14-day Relative Strength Index (RSI), moving averages, and momentum risk evaluations.
 
-# Key Architectural Features
-- **Low Latency & High Concurrency:** Fully asynchronous request handling powered by ASGI / Uvicorn.
-- **Enterprise Security:** API-Key header authentication layer (`X-API-KEY`) designed for multi-tenant B2B client tiering.
-- **Live Market Data Pipelines:** Dynamic market data integration via Yahoo Finance feeds.
-- **Strict Data Contracts:** Pydantic v2 data validation and serialized JSON output.
-- **API Spec & Testing:** Interactive OpenAPI documentation with automated Bruno API test suites.
 
-## Stack
-- **Backend:** Python 3.12+, FastAPI, Uvicorn
-- **Validation:** Pydantic v2
-- **Data Integration:** yfinance
-- **Testing:** Bruno
+# Live Production Demo
+- **Live Terminal:** [https://alpha-metrics-engine.onrender.com](https://alpha-metrics-engine.onrender.com)
+- **Interactive Swagger Docs:** [https://alpha-metrics-engine.onrender.com/docs](https://alpha-metrics-engine.onrender.com/docs)
 
-##  Quick Start
+---
 
+#Features
+- **Real-Time Multi-Asset Feed:** Ingests live data across Equities, Precious Metals, FX, ETFs, and Crypto via `yfinance`.
+- **Synthetic Asset Calculation:** Dynamic pricing model computing Gram Gold (TRY) from Troy Ounce and USD/TRY time-series data.
+- **Quantitative RSI Engine:** Vectorized RSI computation and risk status detection using `pandas`.
+- **High-Performance Caching:** Cache-Aside architecture with Redis integration for sub-5ms cached latency.
+- **Enterprise Security:** Header-based API Key validation (`X-API-KEY`) with strict Pydantic v2 schemas.
+- **Production Architecture:** Containerized with multi-stage Docker builds and automated 24/7 uptime monitoring.
+
+---
+
+# Stack
+- **Backend:** Python 3.12, FastAPI, Uvicorn
+- **Data & Computation:** Pandas, NumPy, yfinance
+- **Caching & Infrastructure:** Redis 7, Docker, Docker Compose, Render
+- **Validation & Security:** Pydantic v2, API Key Auth
+
+---
+
+Local Deployment (Docker Compose)
+To run the full stack (FastAPI + Redis) locally:
+
+```bash
+git clone [https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine.git](https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine.git)
+cd Alpha-Metrics-Engine
+docker compose up --build
 ```bash
 
 git clone [https://github.com/aybarsduran30-maker/AlphaMetrics-Engine.git](https://github.com/aybarsduran30-maker/AlphaMetrics-Engine.git)
