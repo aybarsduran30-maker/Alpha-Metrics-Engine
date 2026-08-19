@@ -26,3 +26,18 @@ pip install -r requirements.txt
 
 
 uvicorn main:app --reload
+
+Built and deployed AlphaMetrics Engine, a real-time financial analytics terminal and API.
+
+The stack and architecture:
+- FastAPI backend integrated with Pandas for time-series calculations
+- Vectorized 14-day RSI and moving average risk metrics
+- Header-based API key authentication and strict Pydantic schemas
+- Embedded dark-mode web terminal
+- Hosted on Render with automated CI/CD from GitHub
+
+Live Dashboard: https://alpha-metrics-engine.onrender.com
+API Docs: https://alpha-metrics-engine.onrender.com/docs
+GitHub Repo: https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine
+
+#python #fastapi #datascience #backend #fintech #softwareengineering
