@@ -25,7 +25,7 @@ A real-time financial analytics backend, quantitative risk terminal, and contain
 - **Caching & Infrastructure:** Redis 7, Docker, Docker Compose, Render
 - **Validation & Security:** Pydantic v2, API Key Auth
 
----
+---    api will be live at :http://localhost:8000
 
 Local Deployment (Docker Compose)
 To run the full stack (FastAPI + Redis) locally:
