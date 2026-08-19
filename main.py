@@ -8,7 +8,7 @@ import datetime
 
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
-    version="1.2.0"
+    version="2.0.0"
 )
 
 API_KEY_NAME = "X-API-KEY"
@@ -30,6 +30,7 @@ async def authenticate_client(api_key: str = Security(api_key_header)):
 class MarketRiskMetric(BaseModel):
     ticker: str
     price: float
+    change_percent: float
     currency: str
     fifty_day_average: float
     rsi_14: float
@@ -56,10 +57,13 @@ async def get_metrics(ticker: str):
         if hist.empty or len(hist) < 14:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, 
-                detail=f"Insufficient historical market data for ticker '{ticker_clean}'."
+                detail=f"Insufficient market data for '{ticker_clean}'."
             )
             
         current_price = float(hist['Close'].iloc[-1])
+        prev_close = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else current_price
+        change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
+        
         rsi_val = calculate_rsi(hist['Close'], period=14)
         
         info = stock.fast_info
@@ -67,15 +71,16 @@ async def get_metrics(ticker: str):
         currency = str(info.currency) if info.currency else "USD"
 
         if rsi_val >= 70:
-            status_desc = "Overbought (High Correction Risk)"
+            status_desc = "Overbought"
         elif rsi_val <= 30:
-            status_desc = "Oversold (Technical Rebound Potential)"
+            status_desc = "Oversold"
         else:
-            status_desc = "Neutral / Stable Momentum"
+            status_desc = "Neutral"
 
         return MarketRiskMetric(
             ticker=ticker_clean,
             price=round(current_price, 2),
+            change_percent=change_pct,
             currency=currency,
             fifty_day_average=round(fifty_avg, 2),
             rsi_14=rsi_val,
@@ -98,109 +103,145 @@ async def serve_dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AlphaMetrics | Market Intelligence</title>
+        <title>AlphaMetrics | Market Watchlist</title>
         <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
             body { font-family: 'JetBrains Mono', monospace; background-color: #0b0f19; color: #f3f4f6; }
         </style>
     </head>
-    <body class="min-h-screen flex flex-col items-center justify-center p-4">
-        <div class="w-full max-w-xl bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-2xl">
-            <div class="flex items-center justify-between border-b border-gray-800 pb-4 mb-6">
+    <body class="min-h-screen p-4 sm:p-8 flex justify-center">
+        <div class="w-full max-w-4xl">
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-800 pb-6 mb-6">
                 <div>
-                    <h1 class="text-xl font-bold text-emerald-400">AlphaMetrics Intelligence</h1>
-                    <p class="text-xs text-gray-500">Live Institutional Risk Terminal</p>
+                    <h1 class="text-2xl font-bold text-emerald-400 tracking-wide">AlphaMetrics Terminal</h1>
+                    <p class="text-xs text-gray-500 mt-1">Multi-Asset Live Market Watchlist & Momentum Index</p>
                 </div>
-                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-950 text-emerald-400 border border-emerald-800">
-                    Production Live
-                </span>
+                <div class="flex items-center gap-2">
+                    <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
+                        Live Feed
+                    </span>
+                    <button onclick="refreshAll()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
+                        Refresh
+                    </button>
+                </div>
             </div>
 
             <div class="flex gap-2 mb-6">
-                <input id="tickerInput" type="text" placeholder="TICKER (e.g. NVDA, AAPL, TSLA)" value="NVDA" 
-                       class="flex-1 bg-gray-950 border border-gray-800 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 uppercase tracking-wider">
-                <button onclick="fetchData()" class="bg-emerald-500 hover:bg-emerald-400 text-black font-bold px-6 py-3 rounded-lg text-sm transition">
-                    Analyze
+                <input id="newTicker" type="text" placeholder="Add Symbol (e.g. MSFT, ETH-USD, BMW.DE)" 
+                       class="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 uppercase tracking-wider">
+                <button onclick="addCustomTicker()" class="bg-emerald-500 hover:bg-emerald-400 text-black font-bold px-6 py-3 rounded-lg text-sm transition">
+                    + Track
                 </button>
             </div>
 
-            <div id="loading" class="hidden text-center py-8 text-gray-500 text-sm">Processing live market data...</div>
-
-            <div id="resultCard" class="hidden space-y-4">
-                <div class="grid grid-cols-2 gap-4">
-                    <div class="bg-gray-950 border border-gray-800 p-4 rounded-lg">
-                        <span class="text-xs text-gray-500">Current Price</span>
-                        <div id="price" class="text-2xl font-bold text-white mt-1">--</div>
-                    </div>
-                    <div class="bg-gray-950 border border-gray-800 p-4 rounded-lg">
-                        <span class="text-xs text-gray-500">50-Day Moving Avg</span>
-                        <div id="avg50" class="text-2xl font-bold text-gray-300 mt-1">--</div>
-                    </div>
-                </div>
-
-                <div class="bg-gray-950 border border-gray-800 p-4 rounded-lg">
-                    <div class="flex justify-between items-center mb-2">
-                        <span class="text-xs text-gray-500">14-Day RSI Indicator</span>
-                        <span id="rsiValue" class="text-sm font-bold text-emerald-400">--</span>
-                    </div>
-                    <div class="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
-                        <div id="rsiBar" class="bg-emerald-500 h-2 rounded-full transition-all duration-500" style="width: 50%"></div>
-                    </div>
-                    <div class="flex justify-between text-[10px] text-gray-600 mt-1">
-                        <span>Oversold (30)</span>
-                        <span>Neutral (50)</span>
-                        <span>Overbought (70)</span>
-                    </div>
-                </div>
-
-                <div class="bg-gray-950 border border-gray-800 p-4 rounded-lg">
-                    <span class="text-xs text-gray-500">Momentum Evaluation</span>
-                    <div id="status" class="text-sm font-bold text-amber-400 mt-1">--</div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-2xl">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-sm">
+                        <thead class="bg-gray-950 border-b border-gray-800 text-xs text-gray-400 uppercase tracking-wider">
+                            <tr>
+                                <th class="py-3 px-4">Asset</th>
+                                <th class="py-3 px-4">Price</th>
+                                <th class="py-3 px-4">24h Change</th>
+                                <th class="py-3 px-4">50D Avg</th>
+                                <th class="py-3 px-4">14D RSI</th>
+                                <th class="py-3 px-4">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="watchlistBody" class="divide-y divide-gray-800">
+                            <tr>
+                                <td colspan="6" class="text-center py-8 text-gray-500 text-xs">Loading live watchlist...</td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
 
         <script>
-            async function fetchData() {
-                const ticker = document.getElementById('tickerInput').value.trim();
-                if(!ticker) return;
-                
-                document.getElementById('loading').classList.remove('hidden');
-                document.getElementById('resultCard').classList.add('hidden');
+            let defaultTickers = ['NVDA', 'AAPL', 'TSLA', 'MSFT', 'BTC-USD', 'MBG.DE'];
 
+            async function fetchRowData(ticker) {
                 try {
                     const res = await fetch(`/api/v1/metrics/${ticker}`);
-                    if(!res.ok) throw new Error('Data fetch failed');
-                    const data = await res.json();
-
-                    document.getElementById('price').innerText = `${data.price} ${data.currency}`;
-                    document.getElementById('avg50').innerText = `${data.fifty_day_average} ${data.currency}`;
-                    document.getElementById('rsiValue').innerText = data.rsi_14;
-                    document.getElementById('status').innerText = data.momentum_status;
-                    
-                    const rsiBar = document.getElementById('rsiBar');
-                    rsiBar.style.width = `${Math.min(Math.max(data.rsi_14, 0), 100)}%`;
-
-                    if(data.rsi_14 >= 70) {
-                        rsiBar.className = 'bg-red-500 h-2 rounded-full transition-all duration-500';
-                        document.getElementById('status').className = 'text-sm font-bold text-red-400 mt-1';
-                    } else if(data.rsi_14 <= 30) {
-                        rsiBar.className = 'bg-blue-500 h-2 rounded-full transition-all duration-500';
-                        document.getElementById('status').className = 'text-sm font-bold text-blue-400 mt-1';
-                    } else {
-                        rsiBar.className = 'bg-emerald-500 h-2 rounded-full transition-all duration-500';
-                        document.getElementById('status').className = 'text-sm font-bold text-emerald-400 mt-1';
-                    }
-
-                    document.getElementById('resultCard').classList.remove('hidden');
-                } catch(err) {
-                    alert('Market data could not be fetched. Please enter a valid ticker.');
-                } finally {
-                    document.getElementById('loading').classList.add('hidden');
+                    if (!res.ok) return null;
+                    return await res.json();
+                } catch {
+                    return null;
                 }
             }
-            window.onload = fetchData;
+
+            async function renderWatchlist() {
+                const tbody = document.getElementById('watchlistBody');
+                tbody.innerHTML = '';
+
+                for (let ticker of defaultTickers) {
+                    const row = document.createElement('tr');
+                    row.className = 'hover:bg-gray-800/50 transition';
+                    row.id = `row-${ticker.replace(/[^a-zA-Z0-9]/g, '')}`;
+                    row.innerHTML = `
+                        <td class="py-4 px-4 font-bold text-white">${ticker}</td>
+                        <td class="py-4 px-4 text-gray-500 text-xs">Fetching...</td>
+                        <td class="py-4 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-4 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-4 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-4 px-4 text-gray-500 text-xs">--</td>
+                    `;
+                    tbody.appendChild(row);
+
+                    fetchRowData(ticker).then(data => {
+                        const targetRow = document.getElementById(`row-${ticker.replace(/[^a-zA-Z0-9]/g, '')}`);
+                        if (!data) {
+                            if(targetRow) targetRow.innerHTML = `<td class="py-4 px-4 font-bold text-white">${ticker}</td><td colspan="5" class="py-4 px-4 text-red-500 text-xs">Failed to load</td>`;
+                            return;
+                        }
+
+                        const changeColor = data.change_percent >= 0 ? 'text-emerald-400' : 'text-red-400';
+                        const changeSign = data.change_percent >= 0 ? '+' : '';
+
+                        let rsiBadge = 'bg-gray-800 text-gray-300 border-gray-700';
+                        let statusColor = 'text-gray-400';
+
+                        if (data.rsi_14 >= 70) {
+                            rsiBadge = 'bg-red-950 text-red-400 border-red-800';
+                            statusColor = 'text-red-400';
+                        } else if (data.rsi_14 <= 30) {
+                            rsiBadge = 'bg-blue-950 text-blue-400 border-blue-800';
+                            statusColor = 'text-blue-400';
+                        } else {
+                            rsiBadge = 'bg-emerald-950 text-emerald-400 border-emerald-800';
+                            statusColor = 'text-emerald-400';
+                        }
+
+                        targetRow.innerHTML = `
+                            <td class="py-4 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
+                            <td class="py-4 px-4 font-semibold text-white">${data.price} <span class="text-[10px] text-gray-500">${data.currency}</span></td>
+                            <td class="py-4 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
+                            <td class="py-4 px-4 text-gray-400">${data.fifty_day_average}</td>
+                            <td class="py-4 px-4">
+                                <span class="px-2 py-1 rounded text-xs border ${rsiBadge} font-bold">${data.rsi_14}</span>
+                            </td>
+                            <td class="py-4 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
+                        `;
+                    });
+                }
+            }
+
+            function addCustomTicker() {
+                const input = document.getElementById('newTicker');
+                const val = input.value.trim().toUpperCase();
+                if (val && !defaultTickers.includes(val)) {
+                    defaultTickers.unshift(val);
+                    input.value = '';
+                    renderWatchlist();
+                }
+            }
+
+            function refreshAll() {
+                renderWatchlist();
+            }
+
+            window.onload = renderWatchlist;
         </script>
     </body>
     </html>
