@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import yfinance as yf
 import pandas as pd
 import datetime
+import asyncio
 import json
 import os
 
@@ -20,7 +21,7 @@ except Exception:
 
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
-    version="2.3.0"
+    version="2.4.0"
 )
 
 API_KEY_NAME = "X-API-KEY"
@@ -50,6 +51,15 @@ class MarketRiskMetric(BaseModel):
     generated_at: str
     cache_hit: bool = False
 
+DEFAULT_TICKERS = [
+    'GRAM-ALTIN-TRY', 'GC=F', 'USDTRY=X',
+    'VUAA.L', 'QQQ', '^GSPC',
+    'NVDA', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'TSLA', 'AMD',
+    'THYAO.IS', 'ASELS.IS', 'EREGL.IS',
+    'MBG.DE', 'BMW.DE',
+    'BTC-USD', 'ETH-USD', 'SOL-USD'
+]
+
 def calculate_rsi(data: pd.Series, period: int = 14) -> float:
     delta = data.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -60,11 +70,8 @@ def calculate_rsi(data: pd.Series, period: int = 14) -> float:
     last_rsi = rsi.iloc[-1]
     return round(float(last_rsi), 2) if not pd.isna(last_rsi) else 50.0
 
-@app.get("/api/v1/metrics/{ticker}", response_model=MarketRiskMetric)
-async def get_metrics(ticker: str):
-    ticker_clean = ticker.upper()
+def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
     cache_key = f"market:{ticker_clean}"
-
     if REDIS_AVAILABLE and r_client:
         try:
             cached_data = r_client.get(cache_key)
@@ -75,94 +82,115 @@ async def get_metrics(ticker: str):
         except Exception:
             pass
 
-    try:
-        if ticker_clean == "GRAM-ALTIN-TRY":
-            gold = yf.Ticker("GC=F")
-            usdtry = yf.Ticker("USDTRY=X")
+    if ticker_clean == "GRAM-ALTIN-TRY":
+        gold = yf.Ticker("GC=F")
+        usdtry = yf.Ticker("USDTRY=X")
+        
+        gold_hist = gold.history(period="1mo", interval="1d")
+        usd_hist = usdtry.history(period="1mo", interval="1d")
+        
+        if gold_hist.empty or usd_hist.empty:
+            raise ValueError("Synthetic gold data unavailable")
             
-            gold_hist = gold.history(period="1mo", interval="1d")
-            usd_hist = usdtry.history(period="1mo", interval="1d")
-            
-            if gold_hist.empty or usd_hist.empty:
-                raise HTTPException(status_code=404, detail="Synthetic gold data unavailable")
-                
-            gold_close = gold_hist['Close'].ffill()
-            usd_close = usd_hist['Close'].ffill()
-            
-            latest_gold = float(gold_close.iloc[-1])
-            prev_gold = float(gold_close.iloc[-2]) if len(gold_close) >= 2 else latest_gold
-            latest_usd = float(usd_close.iloc[-1])
-            prev_usd = float(usd_close.iloc[-2]) if len(usd_close) >= 2 else latest_usd
-            
-            current_price = (latest_gold * latest_usd) / 31.1034768
-            prev_price = (prev_gold * prev_usd) / 31.1034768
-            change_pct = round(((current_price - prev_price) / prev_price) * 100, 2)
-            
-            res_obj = MarketRiskMetric(
-                ticker="GRAM-ALTIN-TRY",
-                price=round(current_price, 2),
-                change_percent=change_pct,
-                currency="TRY",
-                fifty_day_average=round(current_price * 0.96, 2),
-                rsi_14=62.4,
-                momentum_status="Neutral",
-                generated_at=datetime.datetime.utcnow().isoformat(),
-                cache_hit=False
-            )
-        else:
-            stock = yf.Ticker(ticker_clean)
-            hist = stock.history(period="1mo", interval="1d")
-            
-            if hist.empty or len(hist) < 2:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND, 
-                    detail=f"Insufficient market data for '{ticker_clean}'."
-                )
-                
-            current_price = float(hist['Close'].iloc[-1])
-            prev_close = float(hist['Close'].iloc[-2])
-            change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
-            
-            rsi_val = calculate_rsi(hist['Close'], period=14) if len(hist) >= 14 else 50.0
-            
-            info = stock.fast_info
-            fifty_avg = float(info.fifty_day_average) if info.fifty_day_average else current_price
-            currency = str(info.currency) if info.currency else "USD"
-
-            if rsi_val >= 70:
-                status_desc = "Overbought"
-            elif rsi_val <= 30:
-                status_desc = "Oversold"
-            else:
-                status_desc = "Neutral"
-
-            res_obj = MarketRiskMetric(
-                ticker=ticker_clean,
-                price=round(current_price, 2),
-                change_percent=change_pct,
-                currency=currency,
-                fifty_day_average=round(fifty_avg, 2),
-                rsi_14=rsi_val,
-                momentum_status=status_desc,
-                generated_at=datetime.datetime.utcnow().isoformat(),
-                cache_hit=False
-            )
-
-        if REDIS_AVAILABLE and r_client:
-            try:
-                r_client.setex(cache_key, 60, res_obj.model_dump_json())
-            except Exception:
-                pass
-
-        return res_obj
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail=f"Market data ingestion failure: {str(e)}"
+        gold_close = gold_hist['Close'].ffill()
+        usd_close = usd_hist['Close'].ffill()
+        
+        latest_gold = float(gold_close.iloc[-1])
+        prev_gold = float(gold_close.iloc[-2]) if len(gold_close) >= 2 else latest_gold
+        latest_usd = float(usd_close.iloc[-1])
+        prev_usd = float(usd_close.iloc[-2]) if len(usd_close) >= 2 else latest_usd
+        
+        current_price = (latest_gold * latest_usd) / 31.1034768
+        prev_price = (prev_gold * prev_usd) / 31.1034768
+        change_pct = round(((current_price - prev_price) / prev_price) * 100, 2)
+        
+        res_obj = MarketRiskMetric(
+            ticker="GRAM-ALTIN-TRY",
+            price=round(current_price, 2),
+            change_percent=change_pct,
+            currency="TRY",
+            fifty_day_average=round(current_price * 0.96, 2),
+            rsi_14=62.4,
+            momentum_status="Neutral",
+            generated_at=datetime.datetime.utcnow().isoformat(),
+            cache_hit=False
         )
+    else:
+        stock = yf.Ticker(ticker_clean)
+        hist = stock.history(period="1mo", interval="1d")
+        
+        if hist.empty or len(hist) < 2:
+            raise ValueError(f"Insufficient data for {ticker_clean}")
+            
+        current_price = float(hist['Close'].iloc[-1])
+        prev_close = float(hist['Close'].iloc[-2])
+        change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
+        
+        rsi_val = calculate_rsi(hist['Close'], period=14) if len(hist) >= 14 else 50.0
+        
+        info = stock.fast_info
+        fifty_avg = float(info.fifty_day_average) if info.fifty_day_average else current_price
+        currency = str(info.currency) if info.currency else "USD"
+
+        if rsi_val >= 70:
+            status_desc = "Overbought"
+        elif rsi_val <= 30:
+            status_desc = "Oversold"
+        else:
+            status_desc = "Neutral"
+
+        res_obj = MarketRiskMetric(
+            ticker=ticker_clean,
+            price=round(current_price, 2),
+            change_percent=change_pct,
+            currency=currency,
+            fifty_day_average=round(fifty_avg, 2),
+            rsi_14=rsi_val,
+            momentum_status=status_desc,
+            generated_at=datetime.datetime.utcnow().isoformat(),
+            cache_hit=False
+        )
+
+    if REDIS_AVAILABLE and r_client:
+        try:
+            r_client.setex(cache_key, 60, res_obj.model_dump_json())
+        except Exception:
+            pass
+
+    return res_obj
+
+@app.get("/api/v1/metrics/{ticker}", response_model=MarketRiskMetric)
+async def get_metrics(ticker: str):
+    ticker_clean = ticker.upper()
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, process_single_ticker_sync, ticker_clean)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/watchlist", response_model=list[MarketRiskMetric])
+async def get_watchlist():
+    loop = asyncio.get_event_loop()
+    tasks = [loop.run_in_executor(None, process_single_ticker_sync, t) for t in DEFAULT_TICKERS]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    valid_metrics = []
+    for idx, res in enumerate(results):
+        if isinstance(res, MarketRiskMetric):
+            valid_metrics.append(res)
+        else:
+            valid_metrics.append(MarketRiskMetric(
+                ticker=DEFAULT_TICKERS[idx],
+                price=0.0,
+                change_percent=0.0,
+                currency="N/A",
+                fifty_day_average=0.0,
+                rsi_14=50.0,
+                momentum_status="Offline",
+                generated_at=datetime.datetime.utcnow().isoformat(),
+                cache_hit=False
+            ))
+    return valid_metrics
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
@@ -172,7 +200,7 @@ async def serve_dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AlphaMetrics | Institutional Market Watchlist</title>
+        <title>AlphaMetrics | High-Speed Terminal</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
@@ -188,7 +216,7 @@ async def serve_dashboard():
                 </div>
                 <div class="flex items-center gap-2">
                     <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
-                        Production Live
+                        Batch Async Engine
                     </span>
                     <button onclick="renderWatchlist()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
                         Refresh All
@@ -197,7 +225,7 @@ async def serve_dashboard():
             </div>
 
             <div class="flex gap-2 mb-6">
-                <input id="newTicker" type="text" placeholder="Add Custom Symbol (e.g. INTC, AMZN, BIST)" 
+                <input id="newTicker" type="text" placeholder="Add Custom Symbol (e.g. INTC, AMZN)" 
                        class="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 uppercase tracking-wider">
                 <button onclick="addCustomTicker()" class="bg-emerald-500 hover:bg-emerald-400 text-black font-bold px-6 py-3 rounded-lg text-sm transition">
                     + Track Asset
@@ -218,6 +246,9 @@ async def serve_dashboard():
                             </tr>
                         </thead>
                         <tbody id="watchlistBody" class="divide-y divide-gray-800">
+                            <tr>
+                                <td colspan="6" class="text-center py-12 text-gray-500 text-xs animate-pulse">Loading concurrent watchlist...</td>
+                            </tr>
                         </tbody>
                     </table>
                 </div>
@@ -225,56 +256,15 @@ async def serve_dashboard():
         </div>
 
         <script>
-            let defaultTickers = [
-                'GRAM-ALTIN-TRY', 'GC=F', 'USDTRY=X',
-                'VUAA.L', 'QQQ', '^GSPC',
-                'NVDA', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'TSLA', 'AMD',
-                'THYAO.IS', 'ASELS.IS', 'EREGL.IS',
-                'MBG.DE', 'BMW.DE',
-                'BTC-USD', 'ETH-USD', 'SOL-USD'
-            ];
-
-            async function fetchRowData(ticker) {
-                try {
-                    const res = await fetch(`/api/v1/metrics/${ticker}`);
-                    if (!res.ok) return null;
-                    return await res.json();
-                } catch {
-                    return null;
-                }
-            }
-
             async function renderWatchlist() {
                 const tbody = document.getElementById('watchlistBody');
-                tbody.innerHTML = '';
-
-                defaultTickers.forEach(ticker => {
-                    const cleanId = ticker.replace(/[^a-zA-Z0-9]/g, '_');
-                    const row = document.createElement('tr');
-                    row.className = 'hover:bg-gray-800/40 transition';
-                    row.id = `row-${cleanId}`;
-                    row.innerHTML = `
-                        <td class="py-3.5 px-4 font-bold text-white">${ticker}</td>
-                        <td class="py-3.5 px-4 text-gray-500 text-xs animate-pulse">Loading...</td>
-                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
-                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
-                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
-                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
-                    `;
-                    tbody.appendChild(row);
-
-                    fetchRowData(ticker).then(data => {
-                        const targetRow = document.getElementById(`row-${cleanId}`);
-                        if (!targetRow) return;
-
-                        if (!data) {
-                            targetRow.innerHTML = `
-                                <td class="py-3.5 px-4 font-bold text-white">${ticker}</td>
-                                <td colspan="5" class="py-3.5 px-4 text-red-500 text-xs">Offline / Closed</td>
-                            `;
-                            return;
-                        }
-
+                try {
+                    const res = await fetch('/api/v1/watchlist');
+                    if (!res.ok) throw new Error('API Failure');
+                    const items = await res.json();
+                    
+                    tbody.innerHTML = '';
+                    items.forEach(data => {
                         const changeColor = data.change_percent >= 0 ? 'text-emerald-400' : 'text-red-400';
                         const changeSign = data.change_percent >= 0 ? '+' : '';
 
@@ -292,7 +282,9 @@ async def serve_dashboard():
                             statusColor = 'text-emerald-400';
                         }
 
-                        targetRow.innerHTML = `
+                        const tr = document.createElement('tr');
+                        tr.className = 'hover:bg-gray-800/40 transition';
+                        tr.innerHTML = `
                             <td class="py-3.5 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
                             <td class="py-3.5 px-4 font-semibold text-white">${data.price} <span class="text-[10px] text-gray-500">${data.currency}</span></td>
                             <td class="py-3.5 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
@@ -302,17 +294,48 @@ async def serve_dashboard():
                             </td>
                             <td class="py-3.5 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
                         `;
+                        tbody.appendChild(tr);
                     });
-                });
+                } catch(err) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-red-500 text-xs">Failed to load live data.</td></tr>';
+                }
             }
 
-            function addCustomTicker() {
+            async function addCustomTicker() {
                 const input = document.getElementById('newTicker');
                 const val = input.value.trim().toUpperCase();
-                if (val && !defaultTickers.includes(val)) {
-                    defaultTickers.unshift(val);
-                    input.value = '';
-                    renderWatchlist();
+                if (!val) return;
+
+                const tbody = document.getElementById('watchlistBody');
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-gray-800/40 transition bg-emerald-950/20';
+                tr.innerHTML = `
+                    <td class="py-3.5 px-4 font-bold text-white">${val}</td>
+                    <td colspan="5" class="py-3.5 px-4 text-gray-500 text-xs animate-pulse">Fetching asset data...</td>
+                `;
+                tbody.prepend(tr);
+                input.value = '';
+
+                try {
+                    const res = await fetch(`/api/v1/metrics/${val}`);
+                    if (!res.ok) throw new Error();
+                    const data = await res.json();
+                    
+                    const changeColor = data.change_percent >= 0 ? 'text-emerald-400' : 'text-red-400';
+                    const changeSign = data.change_percent >= 0 ? '+' : '';
+
+                    tr.innerHTML = `
+                        <td class="py-3.5 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
+                        <td class="py-3.5 px-4 font-semibold text-white">${data.price} <span class="text-[10px] text-gray-500">${data.currency}</span></td>
+                        <td class="py-3.5 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
+                        <td class="py-3.5 px-4 text-gray-400">${data.fifty_day_average}</td>
+                        <td class="py-3.5 px-4">
+                            <span class="px-2 py-0.5 rounded text-xs border bg-emerald-950 text-emerald-400 border-emerald-800 font-bold">${data.rsi_14}</span>
+                        </td>
+                        <td class="py-3.5 px-4 font-semibold text-gray-400 text-xs">${data.momentum_status}</td>
+                    `;
+                } catch {
+                    tr.innerHTML = `<td class="py-3.5 px-4 font-bold text-white">${val}</td><td colspan="5" class="py-3.5 px-4 text-red-500 text-xs">Failed to fetch asset data</td>`;
                 }
             }
 
