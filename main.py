@@ -5,10 +5,22 @@ from pydantic import BaseModel
 import yfinance as yf
 import pandas as pd
 import datetime
+import json
+import os
+
+try:
+    import redis
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    r_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=1)
+    r_client.ping()
+    REDIS_AVAILABLE = True
+except Exception:
+    r_client = None
+    REDIS_AVAILABLE = False
 
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
-    version="2.2.1"
+    version="2.3.0"
 )
 
 API_KEY_NAME = "X-API-KEY"
@@ -35,7 +47,8 @@ class MarketRiskMetric(BaseModel):
     fifty_day_average: float
     rsi_14: float
     momentum_status: str
-    generated_at: datetime.datetime
+    generated_at: str
+    cache_hit: bool = False
 
 def calculate_rsi(data: pd.Series, period: int = 14) -> float:
     delta = data.diff()
@@ -50,6 +63,18 @@ def calculate_rsi(data: pd.Series, period: int = 14) -> float:
 @app.get("/api/v1/metrics/{ticker}", response_model=MarketRiskMetric)
 async def get_metrics(ticker: str):
     ticker_clean = ticker.upper()
+    cache_key = f"market:{ticker_clean}"
+
+    if REDIS_AVAILABLE and r_client:
+        try:
+            cached_data = r_client.get(cache_key)
+            if cached_data:
+                parsed = json.loads(cached_data)
+                parsed["cache_hit"] = True
+                return MarketRiskMetric(**parsed)
+        except Exception:
+            pass
+
     try:
         if ticker_clean == "GRAM-ALTIN-TRY":
             gold = yf.Ticker("GC=F")
@@ -73,7 +98,7 @@ async def get_metrics(ticker: str):
             prev_price = (prev_gold * prev_usd) / 31.1034768
             change_pct = round(((current_price - prev_price) / prev_price) * 100, 2)
             
-            return MarketRiskMetric(
+            res_obj = MarketRiskMetric(
                 ticker="GRAM-ALTIN-TRY",
                 price=round(current_price, 2),
                 change_percent=change_pct,
@@ -81,45 +106,56 @@ async def get_metrics(ticker: str):
                 fifty_day_average=round(current_price * 0.96, 2),
                 rsi_14=62.4,
                 momentum_status="Neutral",
-                generated_at=datetime.datetime.utcnow()
+                generated_at=datetime.datetime.utcnow().isoformat(),
+                cache_hit=False
             )
-
-        stock = yf.Ticker(ticker_clean)
-        hist = stock.history(period="1mo", interval="1d")
-        
-        if hist.empty or len(hist) < 2:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail=f"Insufficient market data for '{ticker_clean}'."
-            )
-            
-        current_price = float(hist['Close'].iloc[-1])
-        prev_close = float(hist['Close'].iloc[-2])
-        change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
-        
-        rsi_val = calculate_rsi(hist['Close'], period=14) if len(hist) >= 14 else 50.0
-        
-        info = stock.fast_info
-        fifty_avg = float(info.fifty_day_average) if info.fifty_day_average else current_price
-        currency = str(info.currency) if info.currency else "USD"
-
-        if rsi_val >= 70:
-            status_desc = "Overbought"
-        elif rsi_val <= 30:
-            status_desc = "Oversold"
         else:
-            status_desc = "Neutral"
+            stock = yf.Ticker(ticker_clean)
+            hist = stock.history(period="1mo", interval="1d")
+            
+            if hist.empty or len(hist) < 2:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, 
+                    detail=f"Insufficient market data for '{ticker_clean}'."
+                )
+                
+            current_price = float(hist['Close'].iloc[-1])
+            prev_close = float(hist['Close'].iloc[-2])
+            change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
+            
+            rsi_val = calculate_rsi(hist['Close'], period=14) if len(hist) >= 14 else 50.0
+            
+            info = stock.fast_info
+            fifty_avg = float(info.fifty_day_average) if info.fifty_day_average else current_price
+            currency = str(info.currency) if info.currency else "USD"
 
-        return MarketRiskMetric(
-            ticker=ticker_clean,
-            price=round(current_price, 2),
-            change_percent=change_pct,
-            currency=currency,
-            fifty_day_average=round(fifty_avg, 2),
-            rsi_14=rsi_val,
-            momentum_status=status_desc,
-            generated_at=datetime.datetime.utcnow()
-        )
+            if rsi_val >= 70:
+                status_desc = "Overbought"
+            elif rsi_val <= 30:
+                status_desc = "Oversold"
+            else:
+                status_desc = "Neutral"
+
+            res_obj = MarketRiskMetric(
+                ticker=ticker_clean,
+                price=round(current_price, 2),
+                change_percent=change_pct,
+                currency=currency,
+                fifty_day_average=round(fifty_avg, 2),
+                rsi_14=rsi_val,
+                momentum_status=status_desc,
+                generated_at=datetime.datetime.utcnow().isoformat(),
+                cache_hit=False
+            )
+
+        if REDIS_AVAILABLE and r_client:
+            try:
+                r_client.setex(cache_key, 60, res_obj.model_dump_json())
+            except Exception:
+                pass
+
+        return res_obj
+
     except HTTPException:
         raise
     except Exception as e:
@@ -136,7 +172,7 @@ async def serve_dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AlphaMetrics | Global Market Intelligence</title>
+        <title>AlphaMetrics | Institutional Market Watchlist</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
@@ -148,23 +184,23 @@ async def serve_dashboard():
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-800 pb-6 mb-6">
                 <div>
                     <h1 class="text-2xl font-bold text-emerald-400 tracking-wide">AlphaMetrics Terminal</h1>
-                    <p class="text-xs text-gray-500 mt-1">Institutional Multi-Asset Real-Time Watchlist</p>
+                    <p class="text-xs text-gray-500 mt-1">Multi-Asset Real-Time Watchlist & Quantitative Engine</p>
                 </div>
                 <div class="flex items-center gap-2">
                     <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
-                        Live Feed
+                        Production Live
                     </span>
                     <button onclick="renderWatchlist()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
-                        Refresh
+                        Refresh All
                     </button>
                 </div>
             </div>
 
             <div class="flex gap-2 mb-6">
-                <input id="newTicker" type="text" placeholder="Add Asset Symbol (e.g. INTC, NFLX, COIN)" 
+                <input id="newTicker" type="text" placeholder="Add Custom Symbol (e.g. INTC, AMZN, BIST)" 
                        class="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 uppercase tracking-wider">
                 <button onclick="addCustomTicker()" class="bg-emerald-500 hover:bg-emerald-400 text-black font-bold px-6 py-3 rounded-lg text-sm transition">
-                    + Track
+                    + Track Asset
                 </button>
             </div>
 
@@ -288,4 +324,4 @@ async def serve_dashboard():
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
-    return {"status": "operational", "latency_ms": 0.6}
+    return {"status": "operational", "latency_ms": 0.6, "redis_connected": REDIS_AVAILABLE}
