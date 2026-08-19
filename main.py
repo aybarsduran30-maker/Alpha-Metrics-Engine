@@ -21,7 +21,7 @@ except Exception:
 
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
-    version="2.4.0"
+    version="2.5.0"
 )
 
 API_KEY_NAME = "X-API-KEY"
@@ -50,15 +50,6 @@ class MarketRiskMetric(BaseModel):
     momentum_status: str
     generated_at: str
     cache_hit: bool = False
-
-DEFAULT_TICKERS = [
-    'GRAM-ALTIN-TRY', 'GC=F', 'USDTRY=X',
-    'VUAA.L', 'QQQ', '^GSPC',
-    'NVDA', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'TSLA', 'AMD',
-    'THYAO.IS', 'ASELS.IS', 'EREGL.IS',
-    'MBG.DE', 'BMW.DE',
-    'BTC-USD', 'ETH-USD', 'SOL-USD'
-]
 
 def calculate_rsi(data: pd.Series, period: int = 14) -> float:
     delta = data.diff()
@@ -168,30 +159,6 @@ async def get_metrics(ticker: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/v1/watchlist", response_model=list[MarketRiskMetric])
-async def get_watchlist():
-    loop = asyncio.get_event_loop()
-    tasks = [loop.run_in_executor(None, process_single_ticker_sync, t) for t in DEFAULT_TICKERS]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    valid_metrics = []
-    for idx, res in enumerate(results):
-        if isinstance(res, MarketRiskMetric):
-            valid_metrics.append(res)
-        else:
-            valid_metrics.append(MarketRiskMetric(
-                ticker=DEFAULT_TICKERS[idx],
-                price=0.0,
-                change_percent=0.0,
-                currency="N/A",
-                fifty_day_average=0.0,
-                rsi_14=50.0,
-                momentum_status="Offline",
-                generated_at=datetime.datetime.utcnow().isoformat(),
-                cache_hit=False
-            ))
-    return valid_metrics
-
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
     return """
@@ -212,11 +179,11 @@ async def serve_dashboard():
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-800 pb-6 mb-6">
                 <div>
                     <h1 class="text-2xl font-bold text-emerald-400 tracking-wide">AlphaMetrics Terminal</h1>
-                    <p class="text-xs text-gray-500 mt-1">Multi-Asset Real-Time Watchlist & Quantitative Engine</p>
+                    <p class="text-xs text-gray-500 mt-1">Real-Time Risk & Momentum Engine</p>
                 </div>
                 <div class="flex items-center gap-2">
                     <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
-                        Batch Async Engine
+                        Streaming Live
                     </span>
                     <button onclick="renderWatchlist()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
                         Refresh All
@@ -225,10 +192,10 @@ async def serve_dashboard():
             </div>
 
             <div class="flex gap-2 mb-6">
-                <input id="newTicker" type="text" placeholder="Add Custom Symbol (e.g. INTC, AMZN)" 
+                <input id="newTicker" type="text" placeholder="Add Symbol (e.g. INTC, AMZN, PLTR)" 
                        class="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 uppercase tracking-wider">
                 <button onclick="addCustomTicker()" class="bg-emerald-500 hover:bg-emerald-400 text-black font-bold px-6 py-3 rounded-lg text-sm transition">
-                    + Track Asset
+                    + Track
                 </button>
             </div>
 
@@ -246,9 +213,6 @@ async def serve_dashboard():
                             </tr>
                         </thead>
                         <tbody id="watchlistBody" class="divide-y divide-gray-800">
-                            <tr>
-                                <td colspan="6" class="text-center py-12 text-gray-500 text-xs animate-pulse">Loading concurrent watchlist...</td>
-                            </tr>
                         </tbody>
                     </table>
                 </div>
@@ -256,86 +220,99 @@ async def serve_dashboard():
         </div>
 
         <script>
-            async function renderWatchlist() {
-                const tbody = document.getElementById('watchlistBody');
+            let defaultTickers = [
+                'GRAM-ALTIN-TRY', 'GC=F', 'USDTRY=X',
+                'VUAA.L', 'QQQ', '^GSPC',
+                'NVDA', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'TSLA', 'AMD',
+                'THYAO.IS', 'ASELS.IS', 'EREGL.IS',
+                'MBG.DE', 'BMW.DE',
+                'BTC-USD', 'ETH-USD', 'SOL-USD'
+            ];
+
+            async function fetchRow(ticker, cleanId) {
                 try {
-                    const res = await fetch('/api/v1/watchlist');
-                    if (!res.ok) throw new Error('API Failure');
-                    const items = await res.json();
-                    
-                    tbody.innerHTML = '';
-                    items.forEach(data => {
-                        const changeColor = data.change_percent >= 0 ? 'text-emerald-400' : 'text-red-400';
-                        const changeSign = data.change_percent >= 0 ? '+' : '';
-
-                        let rsiBadge = 'bg-gray-800 text-gray-300 border-gray-700';
-                        let statusColor = 'text-gray-400';
-
-                        if (data.rsi_14 >= 70) {
-                            rsiBadge = 'bg-red-950 text-red-400 border-red-800';
-                            statusColor = 'text-red-400';
-                        } else if (data.rsi_14 <= 30) {
-                            rsiBadge = 'bg-blue-950 text-blue-400 border-blue-800';
-                            statusColor = 'text-blue-400';
-                        } else {
-                            rsiBadge = 'bg-emerald-950 text-emerald-400 border-emerald-800';
-                            statusColor = 'text-emerald-400';
-                        }
-
-                        const tr = document.createElement('tr');
-                        tr.className = 'hover:bg-gray-800/40 transition';
-                        tr.innerHTML = `
-                            <td class="py-3.5 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
-                            <td class="py-3.5 px-4 font-semibold text-white">${data.price} <span class="text-[10px] text-gray-500">${data.currency}</span></td>
-                            <td class="py-3.5 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
-                            <td class="py-3.5 px-4 text-gray-400">${data.fifty_day_average}</td>
-                            <td class="py-3.5 px-4">
-                                <span class="px-2 py-0.5 rounded text-xs border ${rsiBadge} font-bold">${data.rsi_14}</span>
-                            </td>
-                            <td class="py-3.5 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
-                        `;
-                        tbody.appendChild(tr);
-                    });
-                } catch(err) {
-                    tbody.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-red-500 text-xs">Failed to load live data.</td></tr>';
-                }
-            }
-
-            async function addCustomTicker() {
-                const input = document.getElementById('newTicker');
-                const val = input.value.trim().toUpperCase();
-                if (!val) return;
-
-                const tbody = document.getElementById('watchlistBody');
-                const tr = document.createElement('tr');
-                tr.className = 'hover:bg-gray-800/40 transition bg-emerald-950/20';
-                tr.innerHTML = `
-                    <td class="py-3.5 px-4 font-bold text-white">${val}</td>
-                    <td colspan="5" class="py-3.5 px-4 text-gray-500 text-xs animate-pulse">Fetching asset data...</td>
-                `;
-                tbody.prepend(tr);
-                input.value = '';
-
-                try {
-                    const res = await fetch(`/api/v1/metrics/${val}`);
+                    const res = await fetch(`/api/v1/metrics/${ticker}`);
                     if (!res.ok) throw new Error();
                     const data = await res.json();
                     
+                    const row = document.getElementById(`row-${cleanId}`);
+                    if (!row) return;
+
                     const changeColor = data.change_percent >= 0 ? 'text-emerald-400' : 'text-red-400';
                     const changeSign = data.change_percent >= 0 ? '+' : '';
 
-                    tr.innerHTML = `
+                    let rsiBadge = 'bg-emerald-950 text-emerald-400 border-emerald-800';
+                    let statusColor = 'text-emerald-400';
+
+                    if (data.rsi_14 >= 70) {
+                        rsiBadge = 'bg-red-950 text-red-400 border-red-800';
+                        statusColor = 'text-red-400';
+                    } else if (data.rsi_14 <= 30) {
+                        rsiBadge = 'bg-blue-950 text-blue-400 border-blue-800';
+                        statusColor = 'text-blue-400';
+                    }
+
+                    row.innerHTML = `
                         <td class="py-3.5 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
                         <td class="py-3.5 px-4 font-semibold text-white">${data.price} <span class="text-[10px] text-gray-500">${data.currency}</span></td>
                         <td class="py-3.5 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
                         <td class="py-3.5 px-4 text-gray-400">${data.fifty_day_average}</td>
                         <td class="py-3.5 px-4">
-                            <span class="px-2 py-0.5 rounded text-xs border bg-emerald-950 text-emerald-400 border-emerald-800 font-bold">${data.rsi_14}</span>
+                            <span class="px-2 py-0.5 rounded text-xs border ${rsiBadge} font-bold">${data.rsi_14}</span>
                         </td>
-                        <td class="py-3.5 px-4 font-semibold text-gray-400 text-xs">${data.momentum_status}</td>
+                        <td class="py-3.5 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
                     `;
                 } catch {
-                    tr.innerHTML = `<td class="py-3.5 px-4 font-bold text-white">${val}</td><td colspan="5" class="py-3.5 px-4 text-red-500 text-xs">Failed to fetch asset data</td>`;
+                    const row = document.getElementById(`row-${cleanId}`);
+                    if (row) {
+                        row.innerHTML = `<td class="py-3.5 px-4 font-bold text-white">${ticker}</td><td colspan="5" class="py-3.5 px-4 text-red-500 text-xs">Offline / Market Closed</td>`;
+                    }
+                }
+            }
+
+            async function renderWatchlist() {
+                const tbody = document.getElementById('watchlistBody');
+                tbody.innerHTML = '';
+
+                defaultTickers.forEach(ticker => {
+                    const cleanId = ticker.replace(/[^a-zA-Z0-9]/g, '_');
+                    const row = document.createElement('tr');
+                    row.className = 'hover:bg-gray-800/40 transition';
+                    row.id = `row-${cleanId}`;
+                    row.innerHTML = `
+                        <td class="py-3.5 px-4 font-bold text-white">${ticker}</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs animate-pulse">Loading...</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
+                    `;
+                    tbody.appendChild(row);
+                });
+
+                const poolLimit = 4;
+                let index = 0;
+
+                async function worker() {
+                    while (index < defaultTickers.length) {
+                        const currentIndex = index++;
+                        const ticker = defaultTickers[currentIndex];
+                        const cleanId = ticker.replace(/[^a-zA-Z0-9]/g, '_');
+                        await fetchRow(ticker, cleanId);
+                    }
+                }
+
+                const workers = Array.from({ length: poolLimit }, () => worker());
+                await Promise.all(workers);
+            }
+
+            function addCustomTicker() {
+                const input = document.getElementById('newTicker');
+                const val = input.value.trim().toUpperCase();
+                if (val && !defaultTickers.includes(val)) {
+                    defaultTickers.unshift(val);
+                    input.value = '';
+                    renderWatchlist();
                 }
             }
 
