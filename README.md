@@ -10,13 +10,13 @@ AlphaMetrics is a high-throughput, low-latency microservice built with FastAPI t
 
 \- Low Latency \& High Concurrency: Fully asynchronous request handling powered by ASGI / Uvicorn.
 
-\- \*\*Enterprise Security:\*\* API-Key header authentication layer ) designed for multi-tenant B2B client tiering.
+\-Enterprise Security:API-Key header authentication layer ) designed for multi-tenant B2B client tiering.
 
 \- Live Market Data Pipeline: Dynamic market data integration via Yahoo Finance feeds.
 
-\- Strict Data Contracts:\*\* Pydantic v2 data validation and serialized JSON output.
+\- Strict Data Contracts:Pydantic v2 data validation and serialized JSON output.
 
-\- API Spec \& Testing:\*\* Interactive OpenAPI documentation with automated Bruno API test suites.
+\- API Spec \& Testing: Interactive OpenAPI documentation with automated Bruno API test suites.
 
 
 
