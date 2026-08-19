@@ -8,7 +8,7 @@ import datetime
 
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
-    version="2.0.0"
+    version="2.2.0"
 )
 
 API_KEY_NAME = "X-API-KEY"
@@ -51,20 +51,47 @@ def calculate_rsi(data: pd.Series, period: int = 14) -> float:
 async def get_metrics(ticker: str):
     ticker_clean = ticker.upper()
     try:
+        if ticker_clean == "GRAM-ALTIN-TRY":
+            gold = yf.Ticker("GC=F")
+            usdtry = yf.Ticker("USDTRY=X")
+            
+            gold_hist = gold.history(period="1mo", interval="1d")
+            usd_hist = usdtry.history(period="1mo", interval="1d")
+            
+            if gold_hist.empty or usd_hist.empty:
+                raise HTTPException(status_code=404, detail="Synthetic gold data unavailable")
+                
+            merged_close = (gold_hist['Close'] * usd_hist['Close']) / 31.1034768
+            current_price = float(merged_close.iloc[-1])
+            prev_close = float(merged_close.iloc[-2]) if len(merged_close) >= 2 else current_price
+            change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
+            rsi_val = calculate_rsi(merged_close, period=14) if len(merged_close) >= 14 else 50.0
+            
+            return MarketRiskMetric(
+                ticker="GRAM-ALTIN-TRY",
+                price=round(current_price, 2),
+                change_percent=change_pct,
+                currency="TRY",
+                fifty_day_average=round(float(merged_close.mean()), 2),
+                rsi_14=rsi_val,
+                momentum_status="Overbought" if rsi_val >= 70 else ("Oversold" if rsi_val <= 30 else "Neutral"),
+                generated_at=datetime.datetime.utcnow()
+            )
+
         stock = yf.Ticker(ticker_clean)
         hist = stock.history(period="1mo", interval="1d")
         
-        if hist.empty or len(hist) < 14:
+        if hist.empty or len(hist) < 2:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, 
                 detail=f"Insufficient market data for '{ticker_clean}'."
             )
             
         current_price = float(hist['Close'].iloc[-1])
-        prev_close = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else current_price
+        prev_close = float(hist['Close'].iloc[-2])
         change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
         
-        rsi_val = calculate_rsi(hist['Close'], period=14)
+        rsi_val = calculate_rsi(hist['Close'], period=14) if len(hist) >= 14 else 50.0
         
         info = stock.fast_info
         fifty_avg = float(info.fifty_day_average) if info.fifty_day_average else current_price
@@ -103,7 +130,7 @@ async def serve_dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AlphaMetrics | Market Watchlist</title>
+        <title>AlphaMetrics | Global Market Intelligence</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
@@ -111,24 +138,24 @@ async def serve_dashboard():
         </style>
     </head>
     <body class="min-h-screen p-4 sm:p-8 flex justify-center">
-        <div class="w-full max-w-4xl">
+        <div class="w-full max-w-5xl">
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-800 pb-6 mb-6">
                 <div>
                     <h1 class="text-2xl font-bold text-emerald-400 tracking-wide">AlphaMetrics Terminal</h1>
-                    <p class="text-xs text-gray-500 mt-1">Multi-Asset Live Market Watchlist & Momentum Index</p>
+                    <p class="text-xs text-gray-500 mt-1">Institutional Multi-Asset Real-Time Watchlist</p>
                 </div>
                 <div class="flex items-center gap-2">
                     <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
                         Live Feed
                     </span>
-                    <button onclick="refreshAll()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
+                    <button onclick="renderWatchlist()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
                         Refresh
                     </button>
                 </div>
             </div>
 
             <div class="flex gap-2 mb-6">
-                <input id="newTicker" type="text" placeholder="Add Symbol (e.g. MSFT, ETH-USD, BMW.DE)" 
+                <input id="newTicker" type="text" placeholder="Add Asset Symbol (e.g. INTC, AMZN, NFLX)" 
                        class="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 uppercase tracking-wider">
                 <button onclick="addCustomTicker()" class="bg-emerald-500 hover:bg-emerald-400 text-black font-bold px-6 py-3 rounded-lg text-sm transition">
                     + Track
@@ -140,18 +167,15 @@ async def serve_dashboard():
                     <table class="w-full text-left text-sm">
                         <thead class="bg-gray-950 border-b border-gray-800 text-xs text-gray-400 uppercase tracking-wider">
                             <tr>
-                                <th class="py-3 px-4">Asset</th>
-                                <th class="py-3 px-4">Price</th>
-                                <th class="py-3 px-4">24h Change</th>
-                                <th class="py-3 px-4">50D Avg</th>
-                                <th class="py-3 px-4">14D RSI</th>
-                                <th class="py-3 px-4">Status</th>
+                                <th class="py-3.5 px-4">Asset</th>
+                                <th class="py-3.5 px-4">Price</th>
+                                <th class="py-3.5 px-4">24h Change</th>
+                                <th class="py-3.5 px-4">50D Avg</th>
+                                <th class="py-3.5 px-4">14D RSI</th>
+                                <th class="py-3.5 px-4">Status</th>
                             </tr>
                         </thead>
                         <tbody id="watchlistBody" class="divide-y divide-gray-800">
-                            <tr>
-                                <td colspan="6" class="text-center py-8 text-gray-500 text-xs">Loading live watchlist...</td>
-                            </tr>
                         </tbody>
                     </table>
                 </div>
@@ -159,7 +183,14 @@ async def serve_dashboard():
         </div>
 
         <script>
-            let defaultTickers = ['NVDA', 'AAPL', 'TSLA', 'MSFT', 'BTC-USD', 'MBG.DE'];
+            let defaultTickers = [
+                'GRAM-ALTIN-TRY', 'GC=F', 'USDTRY=X',
+                'VUAA.L', 'QQQ', '^GSPC',
+                'NVDA', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'TSLA', 'AMD',
+                'THYAO.IS', 'ASELS.IS', 'EREGL.IS',
+                'MBG.DE', 'BMW.DE',
+                'BTC-USD', 'ETH-USD', 'SOL-USD'
+            ];
 
             async function fetchRowData(ticker) {
                 try {
@@ -175,24 +206,30 @@ async def serve_dashboard():
                 const tbody = document.getElementById('watchlistBody');
                 tbody.innerHTML = '';
 
-                for (let ticker of defaultTickers) {
+                defaultTickers.forEach(ticker => {
+                    const cleanId = ticker.replace(/[^a-zA-Z0-9]/g, '_');
                     const row = document.createElement('tr');
-                    row.className = 'hover:bg-gray-800/50 transition';
-                    row.id = `row-${ticker.replace(/[^a-zA-Z0-9]/g, '')}`;
+                    row.className = 'hover:bg-gray-800/40 transition';
+                    row.id = `row-${cleanId}`;
                     row.innerHTML = `
-                        <td class="py-4 px-4 font-bold text-white">${ticker}</td>
-                        <td class="py-4 px-4 text-gray-500 text-xs">Fetching...</td>
-                        <td class="py-4 px-4 text-gray-500 text-xs">--</td>
-                        <td class="py-4 px-4 text-gray-500 text-xs">--</td>
-                        <td class="py-4 px-4 text-gray-500 text-xs">--</td>
-                        <td class="py-4 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-3.5 px-4 font-bold text-white">${ticker}</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs animate-pulse">Loading...</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                     `;
                     tbody.appendChild(row);
 
                     fetchRowData(ticker).then(data => {
-                        const targetRow = document.getElementById(`row-${ticker.replace(/[^a-zA-Z0-9]/g, '')}`);
+                        const targetRow = document.getElementById(`row-${cleanId}`);
+                        if (!targetRow) return;
+
                         if (!data) {
-                            if(targetRow) targetRow.innerHTML = `<td class="py-4 px-4 font-bold text-white">${ticker}</td><td colspan="5" class="py-4 px-4 text-red-500 text-xs">Failed to load</td>`;
+                            targetRow.innerHTML = `
+                                <td class="py-3.5 px-4 font-bold text-white">${ticker}</td>
+                                <td colspan="5" class="py-3.5 px-4 text-red-500 text-xs">Offline / Market Closed</td>
+                            `;
                             return;
                         }
 
@@ -214,17 +251,17 @@ async def serve_dashboard():
                         }
 
                         targetRow.innerHTML = `
-                            <td class="py-4 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
-                            <td class="py-4 px-4 font-semibold text-white">${data.price} <span class="text-[10px] text-gray-500">${data.currency}</span></td>
-                            <td class="py-4 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
-                            <td class="py-4 px-4 text-gray-400">${data.fifty_day_average}</td>
-                            <td class="py-4 px-4">
-                                <span class="px-2 py-1 rounded text-xs border ${rsiBadge} font-bold">${data.rsi_14}</span>
+                            <td class="py-3.5 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
+                            <td class="py-3.5 px-4 font-semibold text-white">${data.price} <span class="text-[10px] text-gray-500">${data.currency}</span></td>
+                            <td class="py-3.5 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
+                            <td class="py-3.5 px-4 text-gray-400">${data.fifty_day_average}</td>
+                            <td class="py-3.5 px-4">
+                                <span class="px-2 py-0.5 rounded text-xs border ${rsiBadge} font-bold">${data.rsi_14}</span>
                             </td>
-                            <td class="py-4 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
+                            <td class="py-3.5 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
                         `;
                     });
-                }
+                });
             }
 
             function addCustomTicker() {
@@ -235,10 +272,6 @@ async def serve_dashboard():
                     input.value = '';
                     renderWatchlist();
                 }
-            }
-
-            function refreshAll() {
-                renderWatchlist();
             }
 
             window.onload = renderWatchlist;
