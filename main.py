@@ -27,14 +27,7 @@ async def authenticate_client(api_key: str = Security(api_key_header)):
         )
     return api_key
 
-class MarketRiskMetric(BaseModel):
-    ticker: str
-    price: float
-    currency: str
-    fifty_day_average: float
-    rsi_14: float
-    momentum_status: str
-    generated_at: datetime.datetime
+
 
 def calculate_rsi(data: pd.Series, period: int = 14) -> float:
     delta = data.diff()
