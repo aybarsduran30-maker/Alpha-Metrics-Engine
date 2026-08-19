@@ -3,3 +3,4 @@ uvicorn
 pydantic
 yfinance
 pandas
+redis
