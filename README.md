@@ -18,11 +18,11 @@ AlphaMetrics is a high-throughput, low-latency asynchronous microservice built w
 ##  Quick Start
 
 ```bash
-# Clone the repository
+
 git clone [https://github.com/aybarsduran30-maker/AlphaMetrics-Engine.git](https://github.com/aybarsduran30-maker/AlphaMetrics-Engine.git)
 
-# Install dependencies
+
 pip install -r requirements.txt
 
-# Run ASGI server
+
 uvicorn main:app --reload
