@@ -9,13 +9,29 @@ import asyncio
 import json
 import os
 
+REDIS_ERROR = None
 try:
     import redis
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    r_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=1)
+    
+    if REDIS_URL.startswith("rediss://"):
+        r_client = redis.Redis.from_url(
+            REDIS_URL, 
+            decode_responses=True, 
+            socket_connect_timeout=3, 
+            ssl_cert_reqs=None
+        )
+    else:
+        r_client = redis.Redis.from_url(
+            REDIS_URL, 
+            decode_responses=True, 
+            socket_connect_timeout=3
+        )
+    
     r_client.ping()
     REDIS_AVAILABLE = True
-except Exception:
+except Exception as e:
+    REDIS_ERROR = str(e)
     r_client = None
     REDIS_AVAILABLE = False
 
@@ -324,4 +340,8 @@ async def serve_dashboard():
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
-    return {"status": "operational", "latency_ms": 0.6, "redis_connected": REDIS_AVAILABLE}
+    return {
+        "status": "operational",
+        "redis_connected": REDIS_AVAILABLE,
+        "redis_error": REDIS_ERROR
+    }
