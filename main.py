@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Security, status, Depends
+from fastapi import FastAPI, HTTPException, Security, status, Depends, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
@@ -8,6 +8,7 @@ import datetime
 import asyncio
 import json
 import os
+
 
 REDIS_ERROR = None
 try:
@@ -37,8 +38,9 @@ except Exception as e:
 
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
-    version="2.5.0"
+    version="3.0.0"
 )
+
 
 API_KEY_NAME = "X-API-KEY"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
@@ -66,6 +68,7 @@ class MarketRiskMetric(BaseModel):
     momentum_status: str
     generated_at: str
     cache_hit: bool = False
+
 
 def calculate_rsi(data: pd.Series, period: int = 14) -> float:
     delta = data.diff()
@@ -166,6 +169,7 @@ def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
 
     return res_obj
 
+
 @app.get("/api/v1/metrics/{ticker}", response_model=MarketRiskMetric)
 async def get_metrics(ticker: str):
     ticker_clean = ticker.upper()
@@ -174,6 +178,31 @@ async def get_metrics(ticker: str):
         return await loop.run_in_executor(None, process_single_ticker_sync, ticker_clean)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/ws/stream")
+async def websocket_stream_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    loop = asyncio.get_event_loop()
+    try:
+        while True:
+            raw_msg = await websocket.receive_text()
+            payload = json.loads(raw_msg)
+            tickers = payload.get("tickers", [])
+            
+            for ticker in tickers:
+                clean_ticker = ticker.upper()
+                try:
+                    metric = await loop.run_in_executor(None, process_single_ticker_sync, clean_ticker)
+                    await websocket.send_json({"status": "success", "data": metric.model_dump()})
+                except Exception as ex:
+                    await websocket.send_json({"status": "error", "ticker": clean_ticker, "message": str(ex)})
+                await asyncio.sleep(0.05)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
@@ -198,11 +227,11 @@ async def serve_dashboard():
                     <p class="text-xs text-gray-500 mt-1">Real-Time Risk & Momentum Engine</p>
                 </div>
                 <div class="flex items-center gap-2">
-                    <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
-                        Streaming Live
+                    <span id="connBadge" class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
+                        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> WS Connected
                     </span>
-                    <button onclick="renderWatchlist()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
-                        Refresh All
+                    <button onclick="requestStreamAll()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
+                        Stream Sync
                     </button>
                 </div>
             </div>
@@ -245,51 +274,11 @@ async def serve_dashboard():
                 'BTC-USD', 'ETH-USD', 'SOL-USD'
             ];
 
-            async function fetchRow(ticker, cleanId) {
-                try {
-                    const res = await fetch(`/api/v1/metrics/${ticker}`);
-                    if (!res.ok) throw new Error();
-                    const data = await res.json();
-                    
-                    const row = document.getElementById(`row-${cleanId}`);
-                    if (!row) return;
+            let ws = null;
 
-                    const changeColor = data.change_percent >= 0 ? 'text-emerald-400' : 'text-red-400';
-                    const changeSign = data.change_percent >= 0 ? '+' : '';
-
-                    let rsiBadge = 'bg-emerald-950 text-emerald-400 border-emerald-800';
-                    let statusColor = 'text-emerald-400';
-
-                    if (data.rsi_14 >= 70) {
-                        rsiBadge = 'bg-red-950 text-red-400 border-red-800';
-                        statusColor = 'text-red-400';
-                    } else if (data.rsi_14 <= 30) {
-                        rsiBadge = 'bg-blue-950 text-blue-400 border-blue-800';
-                        statusColor = 'text-blue-400';
-                    }
-
-                    row.innerHTML = `
-                        <td class="py-3.5 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
-                        <td class="py-3.5 px-4 font-semibold text-white">${data.price} <span class="text-[10px] text-gray-500">${data.currency}</span></td>
-                        <td class="py-3.5 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
-                        <td class="py-3.5 px-4 text-gray-400">${data.fifty_day_average}</td>
-                        <td class="py-3.5 px-4">
-                            <span class="px-2 py-0.5 rounded text-xs border ${rsiBadge} font-bold">${data.rsi_14}</span>
-                        </td>
-                        <td class="py-3.5 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
-                    `;
-                } catch {
-                    const row = document.getElementById(`row-${cleanId}`);
-                    if (row) {
-                        row.innerHTML = `<td class="py-3.5 px-4 font-bold text-white">${ticker}</td><td colspan="5" class="py-3.5 px-4 text-red-500 text-xs">Offline / Market Closed</td>`;
-                    }
-                }
-            }
-
-            async function renderWatchlist() {
+            function initLayout() {
                 const tbody = document.getElementById('watchlistBody');
                 tbody.innerHTML = '';
-
                 defaultTickers.forEach(ticker => {
                     const cleanId = ticker.replace(/[^a-zA-Z0-9]/g, '_');
                     const row = document.createElement('tr');
@@ -297,7 +286,7 @@ async def serve_dashboard():
                     row.id = `row-${cleanId}`;
                     row.innerHTML = `
                         <td class="py-3.5 px-4 font-bold text-white">${ticker}</td>
-                        <td class="py-3.5 px-4 text-gray-500 text-xs animate-pulse">Loading...</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs animate-pulse">Streaming...</td>
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
@@ -305,21 +294,76 @@ async def serve_dashboard():
                     `;
                     tbody.appendChild(row);
                 });
+            }
 
-                const poolLimit = 4;
-                let index = 0;
+            function updateRowUI(data) {
+                const cleanId = data.ticker.replace(/[^a-zA-Z0-9]/g, '_');
+                const row = document.getElementById(`row-${cleanId}`);
+                if (!row) return;
 
-                async function worker() {
-                    while (index < defaultTickers.length) {
-                        const currentIndex = index++;
-                        const ticker = defaultTickers[currentIndex];
-                        const cleanId = ticker.replace(/[^a-zA-Z0-9]/g, '_');
-                        await fetchRow(ticker, cleanId);
-                    }
+                const changeColor = data.change_percent >= 0 ? 'text-emerald-400' : 'text-red-400';
+                const changeSign = data.change_percent >= 0 ? '+' : '';
+
+                let rsiBadge = 'bg-emerald-950 text-emerald-400 border-emerald-800';
+                let statusColor = 'text-emerald-400';
+
+                if (data.rsi_14 >= 70) {
+                    rsiBadge = 'bg-red-950 text-red-400 border-red-800';
+                    statusColor = 'text-red-400';
+                } else if (data.rsi_14 <= 30) {
+                    rsiBadge = 'bg-blue-950 text-blue-400 border-blue-800';
+                    statusColor = 'text-blue-400';
                 }
 
-                const workers = Array.from({ length: poolLimit }, () => worker());
-                await Promise.all(workers);
+                row.innerHTML = `
+                    <td class="py-3.5 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
+                    <td class="py-3.5 px-4 font-semibold text-white">${data.price} <span class="text-[10px] text-gray-500">${data.currency}</span></td>
+                    <td class="py-3.5 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
+                    <td class="py-3.5 px-4 text-gray-400">${data.fifty_day_average}</td>
+                    <td class="py-3.5 px-4">
+                        <span class="px-2 py-0.5 rounded text-xs border ${rsiBadge} font-bold">${data.rsi_14}</span>
+                    </td>
+                    <td class="py-3.5 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
+                `;
+            }
+
+            function connectWebSocket() {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws/stream`;
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = () => {
+                    const badge = document.getElementById('connBadge');
+                    badge.className = 'inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800';
+                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> WS Connected';
+                    requestStreamAll();
+                };
+
+                ws.onmessage = (event) => {
+                    const response = JSON.parse(event.data);
+                    if (response.status === 'success') {
+                        updateRowUI(response.data);
+                    } else if (response.status === 'error') {
+                        const cleanId = response.ticker.replace(/[^a-zA-Z0-9]/g, '_');
+                        const row = document.getElementById(`row-${cleanId}`);
+                        if (row) {
+                            row.innerHTML = `<td class="py-3.5 px-4 font-bold text-white">${response.ticker}</td><td colspan="5" class="py-3.5 px-4 text-red-500 text-xs">Offline / Market Closed</td>`;
+                        }
+                    }
+                };
+
+                ws.onclose = () => {
+                    const badge = document.getElementById('connBadge');
+                    badge.className = 'inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-red-950 text-red-400 border border-red-800';
+                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-red-400 mr-2"></span> Disconnected';
+                    setTimeout(connectWebSocket, 3000);
+                };
+            }
+
+            function requestStreamAll() {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ tickers: defaultTickers }));
+                }
             }
 
             function addCustomTicker() {
@@ -328,15 +372,20 @@ async def serve_dashboard():
                 if (val && !defaultTickers.includes(val)) {
                     defaultTickers.unshift(val);
                     input.value = '';
-                    renderWatchlist();
+                    initLayout();
+                    requestStreamAll();
                 }
             }
 
-            window.onload = renderWatchlist;
+            window.onload = () => {
+                initLayout();
+                connectWebSocket();
+            };
         </script>
     </body>
     </html>
     """
+
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
