@@ -4,3 +4,7 @@ pydantic
 yfinance
 pandas
 redis
+sqlalchemy
+psycopg2-binary
+pytest
+httpx
