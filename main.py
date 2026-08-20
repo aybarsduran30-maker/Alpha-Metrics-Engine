@@ -188,18 +188,92 @@ def get_history(symbol: str, limit: int = 10, db: Session = Depends(get_db)):
         } for r in records
     ]
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+HTML_CONTENT = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AlphaMetrics Engine</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen p-8">
+    <div class="max-w-4xl mx-auto space-y-6">
+        <header class="border-b border-slate-800 pb-4">
+            <h1 class="text-3xl font-bold tracking-tight text-emerald-400">AlphaMetrics Engine</h1>
+            <p class="text-slate-400 text-sm">Real-Time Risk, Momentum & Quantitative Analytics</p>
+        </header>
+
+        <div class="flex gap-4">
+            <input type="text" id="symbolInput" placeholder="Enter Symbol (e.g. NVDA, AAPL, GRAM-ALTIN-TRY)" 
+                   class="flex-1 bg-slate-900 border border-slate-800 rounded-lg px-4 py-2 text-slate-100 focus:outline-none focus:border-emerald-500">
+            <button onclick="fetchMetrics()" class="bg-emerald-600 hover:bg-emerald-500 font-medium px-6 py-2 rounded-lg transition-colors">Analyze</button>
+        </div>
+
+        <div id="resultCard" class="hidden bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+            <div class="flex justify-between items-center border-b border-slate-800 pb-4">
+                <div>
+                    <h2 id="resSymbol" class="text-2xl font-bold"></h2>
+                    <span id="resStatus" class="px-2.5 py-0.5 rounded-full text-xs font-semibold"></span>
+                </div>
+                <div class="text-right">
+                    <div id="resPrice" class="text-3xl font-extrabold"></div>
+                    <div id="resChange" class="text-sm font-medium"></div>
+                </div>
+            </div>
+            <div class="grid grid-cols-2 gap-4 pt-2">
+                <div class="bg-slate-950 p-4 rounded-lg border border-slate-800/60">
+                    <div class="text-slate-400 text-xs uppercase font-semibold">14-Day RSI</div>
+                    <div id="resRsi" class="text-xl font-bold mt-1"></div>
+                </div>
+                <div class="bg-slate-950 p-4 rounded-lg border border-slate-800/60">
+                    <div class="text-slate-400 text-xs uppercase font-semibold">50-Day Moving Avg</div>
+                    <div id="resAvg" class="text-xl font-bold mt-1"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchMetrics() {
+            const sym = document.getElementById('symbolInput').value.trim();
+            if (!sym) return;
+            const resCard = document.getElementById('resultCard');
+            try {
+                const res = await fetch(`/api/v1/metrics/${sym}`);
+                if (!res.ok) throw new Error('Symbol not found');
+                const data = await res.json();
+                
+                document.getElementById('resSymbol').innerText = data.symbol;
+                document.getElementById('resPrice').innerText = `${data.price} ${data.currency}`;
+                
+                const changeEl = document.getElementById('resChange');
+                changeEl.innerText = `${data.change_24h > 0 ? '+' : ''}${data.change_24h}% (24h)`;
+                changeEl.className = `text-sm font-medium ${data.change_24h >= 0 ? 'text-emerald-400' : 'text-rose-400'}`;
+
+                document.getElementById('resRsi').innerText = data.fourteen_d_rsi;
+                document.getElementById('resAvg').innerText = `${data.fifty_d_avg} ${data.currency}`;
+                
+                const statusEl = document.getElementById('resStatus');
+                statusEl.innerText = data.risk_status;
+                if (data.risk_status === 'Overbought') {
+                    statusEl.className = 'bg-rose-500/10 text-rose-400 border border-rose-500/20 px-2.5 py-0.5 rounded-full text-xs font-semibold';
+                } else if (data.risk_status === 'Oversold') {
+                    statusEl.className = 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2.5 py-0.5 rounded-full text-xs font-semibold';
+                } else {
+                    statusEl.className = 'bg-slate-500/10 text-slate-400 border border-slate-500/20 px-2.5 py-0.5 rounded-full text-xs font-semibold';
+                }
+                
+                resCard.classList.remove('hidden');
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+    </script>
+</body>
+</html>
+"""
 
 @app.get("/", response_class=HTMLResponse)
 def serve_dashboard():
-    root_html = os.path.join(BASE_DIR, "index.html")
-    if os.path.exists(root_html):
-        with open(root_html, "r", encoding="utf-8") as f:
-            return f.read()
-            
-    tmpl_html = os.path.join(BASE_DIR, "templates", "index.html")
-    if os.path.exists(tmpl_html):
-        with open(tmpl_html, "r", encoding="utf-8") as f:
-            return f.read()
-            
-    return "<h1>AlphaMetrics Engine API Live (HTML file not found, visit /docs)</h1>"
+    return HTML_CONTENT
