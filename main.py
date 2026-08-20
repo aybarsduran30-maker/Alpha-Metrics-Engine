@@ -4,11 +4,11 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import datetime
 import asyncio
 import json
 import os
-
 
 REDIS_ERROR = None
 try:
@@ -38,9 +38,8 @@ except Exception as e:
 
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
-    version="3.0.0"
+    version="3.5.0"
 )
-
 
 API_KEY_NAME = "X-API-KEY"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
@@ -69,16 +68,24 @@ class MarketRiskMetric(BaseModel):
     generated_at: str
     cache_hit: bool = False
 
+class BacktestResult(BaseModel):
+    ticker: str
+    period: str
+    strategy_return_pct: float
+    buy_and_hold_return_pct: float
+    sharpe_ratio: float
+    max_drawdown_pct: float
+    total_trades: int
+    win_rate_pct: float
+    analysis_date: str
 
-def calculate_rsi(data: pd.Series, period: int = 14) -> float:
+def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
     delta = data.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
-    last_rsi = rsi.iloc[-1]
-    return round(float(last_rsi), 2) if not pd.isna(last_rsi) else 50.0
+    return rsi
 
 def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
     cache_key = f"market:{ticker_clean}"
@@ -136,7 +143,9 @@ def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
         prev_close = float(hist['Close'].iloc[-2])
         change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
         
-        rsi_val = calculate_rsi(hist['Close'], period=14) if len(hist) >= 14 else 50.0
+        rsi_series = calculate_rsi(hist['Close'], period=14)
+        last_rsi = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
+        rsi_val = round(last_rsi, 2)
         
         info = stock.fast_info
         fifty_avg = float(info.fifty_day_average) if info.fifty_day_average else current_price
@@ -169,6 +178,89 @@ def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
 
     return res_obj
 
+def run_quant_backtest_sync(ticker_clean: str) -> BacktestResult:
+    cache_key = f"backtest:{ticker_clean}"
+    if REDIS_AVAILABLE and r_client:
+        try:
+            cached_data = r_client.get(cache_key)
+            if cached_data:
+                return BacktestResult(**json.loads(cached_data))
+        except Exception:
+            pass
+
+    fetch_ticker = "GC=F" if ticker_clean == "GRAM-ALTIN-TRY" else ticker_clean
+    stock = yf.Ticker(fetch_ticker)
+    df = stock.history(period="1y", interval="1d")
+
+    if df.empty or len(df) < 50:
+        raise ValueError(f"Insufficient history data for {ticker_clean}")
+
+    df['RSI'] = calculate_rsi(df['Close'], period=14)
+    df['Daily_Return'] = df['Close'].pct_change().fillna(0)
+
+    position = 0
+    trades = []
+    strategy_returns = []
+    entry_price = 0.0
+
+    for i in range(len(df)):
+        rsi = df['RSI'].iloc[i]
+        price = df['Close'].iloc[i]
+
+        if position == 0 and rsi < 35:
+            position = 1
+            entry_price = price
+        elif position == 1 and rsi > 65:
+            position = 0
+            ret = (price - entry_price) / entry_price
+            trades.append(ret)
+
+        if position == 1:
+            strategy_returns.append(df['Daily_Return'].iloc[i])
+        else:
+            strategy_returns.append(0.0)
+
+    df['Strategy_Return'] = strategy_returns
+    df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
+    df['Cum_BnH'] = (1 + df['Daily_Return']).cumprod()
+
+    total_strat_return = round((float(df['Cum_Strategy'].iloc[-1]) - 1.0) * 100, 2)
+    total_bnh_return = round((float(df['Cum_BnH'].iloc[-1]) - 1.0) * 100, 2)
+
+    active_returns = df.loc[df['Strategy_Return'] != 0, 'Strategy_Return']
+    if len(active_returns) > 5 and active_returns.std() > 0:
+        sharpe = (active_returns.mean() / active_returns.std()) * np.sqrt(252)
+        sharpe_val = round(float(sharpe), 2)
+    else:
+        sharpe_val = 0.0
+
+    rolling_max = df['Cum_Strategy'].cummax()
+    drawdown = (df['Cum_Strategy'] - rolling_max) / rolling_max
+    max_dd = round(float(drawdown.min()) * 100, 2)
+
+    total_trades = len(trades)
+    wins = [t for t in trades if t > 0]
+    win_rate = round((len(wins) / total_trades) * 100, 2) if total_trades > 0 else 0.0
+
+    res = BacktestResult(
+        ticker=ticker_clean,
+        period="1 Year",
+        strategy_return_pct=total_strat_return,
+        buy_and_hold_return_pct=total_bnh_return,
+        sharpe_ratio=sharpe_val,
+        max_drawdown_pct=max_dd,
+        total_trades=total_trades,
+        win_rate_pct=win_rate,
+        analysis_date=datetime.datetime.utcnow().isoformat()
+    )
+
+    if REDIS_AVAILABLE and r_client:
+        try:
+            r_client.setex(cache_key, 300, res.model_dump_json())
+        except Exception:
+            pass
+
+    return res
 
 @app.get("/api/v1/metrics/{ticker}", response_model=MarketRiskMetric)
 async def get_metrics(ticker: str):
@@ -179,6 +271,14 @@ async def get_metrics(ticker: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/v1/quant/backtest/{ticker}", response_model=BacktestResult)
+async def get_backtest(ticker: str):
+    ticker_clean = ticker.upper()
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, run_quant_backtest_sync, ticker_clean)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.websocket("/ws/stream")
 async def websocket_stream_endpoint(websocket: WebSocket):
@@ -203,7 +303,6 @@ async def websocket_stream_endpoint(websocket: WebSocket):
     except Exception:
         pass
 
-
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
     return """
@@ -212,7 +311,7 @@ async def serve_dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AlphaMetrics | High-Speed Terminal</title>
+        <title>AlphaMetrics | Quant Terminal</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
@@ -224,7 +323,7 @@ async def serve_dashboard():
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-800 pb-6 mb-6">
                 <div>
                     <h1 class="text-2xl font-bold text-emerald-400 tracking-wide">AlphaMetrics Terminal</h1>
-                    <p class="text-xs text-gray-500 mt-1">Real-Time Risk & Momentum Engine</p>
+                    <p class="text-xs text-gray-500 mt-1">Real-Time Risk & Quant Execution Engine</p>
                 </div>
                 <div class="flex items-center gap-2">
                     <span id="connBadge" class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
@@ -255,11 +354,47 @@ async def serve_dashboard():
                                 <th class="py-3.5 px-4">50D Avg</th>
                                 <th class="py-3.5 px-4">14D RSI</th>
                                 <th class="py-3.5 px-4">Status</th>
+                                <th class="py-3.5 px-4 text-right">Quant</th>
                             </tr>
                         </thead>
                         <tbody id="watchlistBody" class="divide-y divide-gray-800">
                         </tbody>
                     </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="quantModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
+            <div class="bg-[#0f172a] border border-gray-800 w-full max-w-lg rounded-xl p-6 relative">
+                <button onclick="closeModal()" class="absolute top-4 right-4 text-gray-400 hover:text-white text-lg font-bold">&times;</button>
+                <div id="modalContent">
+                    <p class="text-xs text-gray-500 uppercase tracking-wider">Algorithmic Backtest Engine</p>
+                    <h3 id="modalTicker" class="text-xl font-bold text-emerald-400 mt-1">--</h3>
+                    <div id="modalLoading" class="py-8 text-center text-xs text-gray-400 animate-pulse">Running 1-Year Quantitative Simulation...</div>
+                    <div id="modalResults" class="hidden mt-4 space-y-3">
+                        <div class="grid grid-cols-2 gap-3">
+                            <div class="bg-gray-900 p-3 rounded border border-gray-800">
+                                <span class="text-[11px] text-gray-500">Strategy Return (1Y)</span>
+                                <p id="mStratRet" class="text-base font-bold">--</p>
+                            </div>
+                            <div class="bg-gray-900 p-3 rounded border border-gray-800">
+                                <span class="text-[11px] text-gray-500">Buy & Hold Return</span>
+                                <p id="mBnhRet" class="text-base font-bold text-gray-400">--</p>
+                            </div>
+                            <div class="bg-gray-900 p-3 rounded border border-gray-800">
+                                <span class="text-[11px] text-gray-500">Sharpe Ratio</span>
+                                <p id="mSharpe" class="text-base font-bold text-emerald-400">--</p>
+                            </div>
+                            <div class="bg-gray-900 p-3 rounded border border-gray-800">
+                                <span class="text-[11px] text-gray-500">Max Drawdown</span>
+                                <p id="mDrawdown" class="text-base font-bold text-red-400">--</p>
+                            </div>
+                        </div>
+                        <div class="bg-gray-900 p-3 rounded border border-gray-800 flex justify-between text-xs">
+                            <span class="text-gray-400">Total Trades: <b id="mTrades" class="text-white">--</b></span>
+                            <span class="text-gray-400">Win Rate: <b id="mWinRate" class="text-emerald-400">--</b></span>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -291,6 +426,11 @@ async def serve_dashboard():
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
+                        <td class="py-3.5 px-4 text-right">
+                            <button onclick="openQuantModal('${ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2 py-1 rounded transition">
+                                Quant
+                            </button>
+                        </td>
                     `;
                     tbody.appendChild(row);
                 });
@@ -324,6 +464,11 @@ async def serve_dashboard():
                         <span class="px-2 py-0.5 rounded text-xs border ${rsiBadge} font-bold">${data.rsi_14}</span>
                     </td>
                     <td class="py-3.5 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
+                    <td class="py-3.5 px-4 text-right">
+                        <button onclick="openQuantModal('${data.ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2 py-1 rounded transition">
+                            Quant
+                        </button>
+                    </td>
                 `;
             }
 
@@ -343,12 +488,6 @@ async def serve_dashboard():
                     const response = JSON.parse(event.data);
                     if (response.status === 'success') {
                         updateRowUI(response.data);
-                    } else if (response.status === 'error') {
-                        const cleanId = response.ticker.replace(/[^a-zA-Z0-9]/g, '_');
-                        const row = document.getElementById(`row-${cleanId}`);
-                        if (row) {
-                            row.innerHTML = `<td class="py-3.5 px-4 font-bold text-white">${response.ticker}</td><td colspan="5" class="py-3.5 px-4 text-red-500 text-xs">Offline / Market Closed</td>`;
-                        }
                     }
                 };
 
@@ -377,6 +516,46 @@ async def serve_dashboard():
                 }
             }
 
+            async function openQuantModal(ticker) {
+                const modal = document.getElementById('quantModal');
+                const loading = document.getElementById('modalLoading');
+                const results = document.getElementById('modalResults');
+                document.getElementById('modalTicker').innerText = ticker;
+                
+                modal.classList.remove('hidden');
+                modal.classList.add('flex');
+                loading.classList.remove('hidden');
+                results.classList.add('hidden');
+
+                try {
+                    const res = await fetch(`/api/v1/quant/backtest/${ticker}`);
+                    const data = await res.json();
+                    
+                    const stratColor = data.strategy_return_pct >= 0 ? 'text-emerald-400' : 'text-red-400';
+                    const stratSign = data.strategy_return_pct >= 0 ? '+' : '';
+                    const bnhColor = data.buy_and_hold_return_pct >= 0 ? 'text-emerald-400' : 'text-red-400';
+                    const bnhSign = data.buy_and_hold_return_pct >= 0 ? '+' : '';
+
+                    document.getElementById('mStratRet').innerHTML = `<span class="${stratColor}">${stratSign}${data.strategy_return_pct}%</span>`;
+                    document.getElementById('mBnhRet').innerHTML = `<span class="${bnhColor}">${bnhSign}${data.buy_and_hold_return_pct}%</span>`;
+                    document.getElementById('mSharpe').innerText = data.sharpe_ratio;
+                    document.getElementById('mDrawdown').innerText = `${data.max_drawdown_pct}%`;
+                    document.getElementById('mTrades').innerText = data.total_trades;
+                    document.getElementById('mWinRate').innerText = `${data.win_rate_pct}%`;
+
+                    loading.classList.add('hidden');
+                    results.classList.remove('hidden');
+                } catch {
+                    loading.innerText = 'Backtest calculation failed for this asset.';
+                }
+            }
+
+            function closeModal() {
+                const modal = document.getElementById('quantModal');
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+            }
+
             window.onload = () => {
                 initLayout();
                 connectWebSocket();
@@ -385,7 +564,6 @@ async def serve_dashboard():
     </body>
     </html>
     """
-
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
