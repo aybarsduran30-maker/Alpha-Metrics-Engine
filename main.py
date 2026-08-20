@@ -188,7 +188,18 @@ def get_history(symbol: str, limit: int = 10, db: Session = Depends(get_db)):
         } for r in records
     ]
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 @app.get("/", response_class=HTMLResponse)
 def serve_dashboard():
-    with open("index.html", "r", encoding="utf-8") as f:
-        return f.read()
+    root_html = os.path.join(BASE_DIR, "index.html")
+    if os.path.exists(root_html):
+        with open(root_html, "r", encoding="utf-8") as f:
+            return f.read()
+            
+    tmpl_html = os.path.join(BASE_DIR, "templates", "index.html")
+    if os.path.exists(tmpl_html):
+        with open(tmpl_html, "r", encoding="utf-8") as f:
+            return f.read()
+            
+    return "<h1>AlphaMetrics Engine API Live (HTML file not found, visit /docs)</h1>"
