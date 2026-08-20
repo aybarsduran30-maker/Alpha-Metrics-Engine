@@ -190,5 +190,5 @@ def get_history(symbol: str, limit: int = 10, db: Session = Depends(get_db)):
 
 @app.get("/", response_class=HTMLResponse)
 def serve_dashboard():
-    with open("templates/index.html", "r", encoding="utf-8") as f:
+    with open("index.html", "r", encoding="utf-8") as f:
         return f.read()
