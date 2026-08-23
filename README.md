@@ -1,60 +1,34 @@
 # AlphaMetrics Financial Intelligence Engine
 
-A real-time financial analytics backend, quantitative risk terminal, and containerized API built with Python, FastAPI, and Pandas. The system ingests live market data to compute technical indicators, including 14-day Relative Strength Index (RSI), moving averages, and momentum risk evaluations.
+[![AlphaMetrics CI Engine](https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine/actions/workflows/ci.yml)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110.0-009688.svg?style=flat&logo=FastAPI&logoColor=white)](https://fastapi.tiangolo.com)
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![Redis](https://img.shields.io/badge/Redis-Upstash%20RAM%20Cache-DC382D.svg?style=flat&logo=redis&logoColor=white)](https://redis.io/)
 
-
-# Live Production Demo
-- **Live Terminal:** [https://alpha-metrics-engine.onrender.com](https://alpha-metrics-engine.onrender.com)
-- **Interactive Swagger Docs:** [https://alpha-metrics-engine.onrender.com/docs](https://alpha-metrics-engine.onrender.com/docs)
-
----
-
-#Features
-- **Real-Time Multi-Asset Feed:** Ingests live data across Equities, Precious Metals, FX, ETFs, and Crypto via `yfinance`.
-- **Synthetic Asset Calculation:** Dynamic pricing model computing Gram Gold (TRY) from Troy Ounce and USD/TRY time-series data.
-- **Quantitative RSI Engine:** Vectorized RSI computation and risk status detection using `pandas`.
-- **High-Performance Caching:** Cache-Aside architecture with Redis integration for sub-5ms cached latency.
-- **Enterprise Security:** Header-based API Key validation (`X-API-KEY`) with strict Pydantic v2 schemas.
-- **Production Architecture:** Containerized with multi-stage Docker builds and automated 24/7 uptime monitoring.
+A high-performance, asynchronous quantitative risk engine and real-time market data analytics platform built with **FastAPI**, **Redis**, and **WebSockets**. Designed to ingest market feeds, compute mathematical risk metrics (14-Day RSI, Sharpe Ratio, Max Drawdown), evaluate synthetic assets, and serve high-throughput financial endpoints under strict rate-limiting policies.
 
 ---
 
-# Stack
-- **Backend:** Python 3.12, FastAPI, Uvicorn
-- **Data & Computation:** Pandas, NumPy, yfinance
-- **Caching & Infrastructure:** Redis 7, Docker, Docker Compose, Render
-- **Validation & Security:** Pydantic v2, API Key Auth
+## Live Production Links
 
----    api will be live at :http://localhost:8000
+* **Live Interactive Terminal:** [https://alpha-metrics-engine.onrender.com](https://alpha-metrics-engine.onrender.com)
+* **Interactive Swagger API Docs:** [https://alpha-metrics-engine.onrender.com/docs](https://alpha-metrics-engine.onrender.com/docs)
+* **System Observability & Health:** [https://alpha-metrics-engine.onrender.com/health](https://alpha-metrics-engine.onrender.com/health)
 
-Local Deployment (Docker Compose)
-To run the full stack (FastAPI + Redis) locally:
+---
 
-```bash
-git clone [https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine.git](https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine.git)
-cd Alpha-Metrics-Engine
-docker compose up --build
-```bash
+## System Architecture
 
-git clone [https://github.com/aybarsduran30-maker/AlphaMetrics-Engine.git](https://github.com/aybarsduran30-maker/AlphaMetrics-Engine.git)
-
-
-pip install -r requirements.txt
-
-
-uvicorn main:app --reload
-
-Built and deployed AlphaMetrics Engine, a real-time financial analytics terminal and API.
-
-The stack and architecture:
-- FastAPI backend integrated with Pandas for time-series calculations
-- Vectorized 14-day RSI and moving average risk metrics
-- Header-based API key authentication and strict Pydantic schemas
-- Embedded dark-mode web terminal
-- Hosted on Render with automated CI/CD from GitHub
-
-Live Dashboard: https://alpha-metrics-engine.onrender.com
-API Docs: https://alpha-metrics-engine.onrender.com/docs
-GitHub Repo: https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine
-
-#python #fastapi #datascience #backend #fintech #softwareengineering
+```mermaid
+flowchart TD
+    Client[Browser / Quant Bot / REST Client] -->|HTTP / REST API| RL[Redis Sliding-Window Rate Limiter]
+    Client <-->|Bi-directional Stream| WS[FastAPI WebSocket Endpoint /ws/stream]
+    
+    RL --> Router[FastAPI Router & Security Layer]
+    Router --> Ingest[Async Ingestion & Synthetic Pricing Engine]
+    
+    Ingest <-->|Sub-10ms In-Memory Cache| Redis[(Upstash Redis RAM Layer)]
+    Ingest -->|Vectorized Analytics| Quant[Quant Risk Engine: RSI / Sharpe / Drawdown]
+    
+    Quant --> DB[(PostgreSQL / AssetMetricHistory)]
+    Quant --> LiveUI[Tailwind & Vanilla JS Reactive Terminal]
