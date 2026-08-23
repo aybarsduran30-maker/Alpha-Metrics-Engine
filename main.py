@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Security, status, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Security, status, Depends, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse
 from fastapi.security.api_key import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yfinance as yf
 import pandas as pd
@@ -9,6 +10,7 @@ import datetime
 import asyncio
 import json
 import os
+import time
 
 REDIS_ERROR = None
 try:
@@ -41,6 +43,14 @@ app = FastAPI(
     version="3.5.0"
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 API_KEY_NAME = "X-API-KEY"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
@@ -48,6 +58,35 @@ VALID_API_KEYS = {
     "tier1_secret_prime_token_99": "Enterprise Client Tier 1",
     "tier2_analytics_beta_token_44": "Enterprise Client Tier 2"
 }
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if request.url.path in ["/health", "/docs", "/openapi.json", "/"]:
+        return await call_next(request)
+
+    if REDIS_AVAILABLE and r_client:
+        client_ip = request.client.host if request.client else "unknown"
+        window = int(time.time()) // 60
+        key = f"rate_limit:{client_ip}:{window}"
+
+        try:
+            pipe = r_client.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, 60)
+            results = pipe.execute()
+            request_count = results[0]
+
+            if request_count > 60:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Rate limit exceeded. Maximum 60 requests per minute."
+                )
+        except HTTPException as http_exc:
+            raise http_exc
+        except Exception:
+            pass
+
+    return await call_next(request)
 
 async def authenticate_client(api_key: str = Security(api_key_header)):
     if not api_key or api_key not in VALID_API_KEYS:
@@ -261,6 +300,18 @@ def run_quant_backtest_sync(ticker_clean: str) -> BacktestResult:
             pass
 
     return res
+
+@app.get("/health", status_code=status.HTTP_200_OK, tags=["Monitoring"])
+async def health_check():
+    start_time = time.perf_counter()
+    latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    return {
+        "status": "operational",
+        "redis_connected": REDIS_AVAILABLE,
+        "redis_error": REDIS_ERROR,
+        "latency_ms": latency_ms,
+        "version": "3.5.0"
+    }
 
 @app.get("/api/v1/metrics/{ticker}", response_model=MarketRiskMetric)
 async def get_metrics(ticker: str):
@@ -564,11 +615,3 @@ async def serve_dashboard():
     </body>
     </html>
     """
-
-@app.get("/health", status_code=status.HTTP_200_OK)
-async def health_check():
-    return {
-        "status": "operational",
-        "redis_connected": REDIS_AVAILABLE,
-        "redis_error": REDIS_ERROR
-    }
