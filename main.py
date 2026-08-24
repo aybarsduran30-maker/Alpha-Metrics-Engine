@@ -41,7 +41,10 @@ except Exception as e:
 
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
-    version="4.0.0"
+    version="4.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
 )
 
 app.add_middleware(
@@ -341,9 +344,9 @@ def run_monte_carlo_var_sync(ticker_clean: str, days: int = 1, simulations: int 
     df = stock.history(period="1y", interval="1d")
     
     if df.empty or len(df) < 50:
-        raise ValueError(f"Insufficient historical data for {ticker_clean}")
+        raise ValueError(f"Insufficient historical data or upstream rate limited for {ticker_clean}")
         
-    close_prices = df["Close"].dropna()
+    close_prices = df["Close"].ffill().dropna()
     daily_returns = close_prices.pct_change().dropna().values
     
     mean_return = float(np.mean(daily_returns))
