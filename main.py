@@ -774,3 +774,107 @@ async def serve_dashboard():
     </body>
     </html>
     """
+
+@app.get("/api/v1/reports/audit/{ticker}", response_class=HTMLResponse, tags=["Enterprise Reporting"])
+async def generate_audit_report(ticker: str):
+    clean_ticker = ticker.strip().upper()
+    try:
+        loop = asyncio.get_event_loop()
+        metric = await loop.run_in_executor(None, process_single_ticker_sync, clean_ticker)
+        var_data = await loop.run_in_executor(None, run_monte_carlo_var_sync, clean_ticker, 1, 5000)
+        backtest_data = await loop.run_in_executor(None, run_quant_backtest_sync, clean_ticker)
+        
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>AlphaMetrics Institutional Audit | {clean_ticker}</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+            <style>
+                @media print {{
+                    body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+                    .no-print {{ display: none; }}
+                }}
+            </style>
+        </head>
+        <body class="bg-[#0b0f19] text-gray-100 p-8 font-mono max-w-4xl mx-auto min-h-screen">
+            <div class="flex justify-between items-center border-b border-gray-800 pb-4 mb-6">
+                <div>
+                    <h1 class="text-xl font-bold text-emerald-400 tracking-wider">ALPHAMETRICS QUANTITATIVE AUDIT REPORT</h1>
+                    <p class="text-xs text-gray-500">Document ID: SEC-RISK-{int(time.time())} | Classification: STRICTLY CONFIDENTIAL</p>
+                </div>
+                <button onclick="window.print()" class="no-print bg-emerald-500 hover:bg-emerald-400 text-black px-4 py-2 text-xs font-bold rounded transition">
+                    Print / Export PDF
+                </button>
+            </div>
+
+            <div class="grid grid-cols-3 gap-4 mb-6">
+                <div class="bg-gray-900 border border-gray-800 p-4 rounded-lg">
+                    <span class="text-[10px] text-gray-500 uppercase">Target Asset</span>
+                    <p class="text-lg font-bold text-white mt-1">{clean_ticker}</p>
+                </div>
+                <div class="bg-gray-900 border border-gray-800 p-4 rounded-lg">
+                    <span class="text-[10px] text-gray-500 uppercase">Spot Settlement Price</span>
+                    <p class="text-lg font-bold text-emerald-400 mt-1">{metric.price} {metric.currency}</p>
+                </div>
+                <div class="bg-gray-900 border border-gray-800 p-4 rounded-lg">
+                    <span class="text-[10px] text-gray-500 uppercase">14-Day RSI Status</span>
+                    <p class="text-lg font-bold text-white mt-1">{metric.rsi_14} ({metric.momentum_status})</p>
+                </div>
+            </div>
+
+            <div class="bg-gray-900 border border-gray-800 rounded-lg p-6 mb-6">
+                <h2 class="text-sm font-bold text-emerald-400 uppercase tracking-wider mb-4">1. Tail-Risk & Value at Risk Modeling (5,000 Iterations)</h2>
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
+                    <div>
+                        <span class="text-gray-500">Annualized Volatility</span>
+                        <p class="text-sm font-bold text-white mt-1">{var_data['volatility_annualized_pct']}%</p>
+                    </div>
+                    <div>
+                        <span class="text-gray-500">95% Daily VaR Limit</span>
+                        <p class="text-sm font-bold text-amber-400 mt-1">-{var_data['var_95_max_loss']} {metric.currency}</p>
+                    </div>
+                    <div>
+                        <span class="text-gray-500">99% Extreme VaR Limit</span>
+                        <p class="text-sm font-bold text-red-400 mt-1">-{var_data['var_99_max_loss']} {metric.currency}</p>
+                    </div>
+                    <div>
+                        <span class="text-gray-500">Expected Shortfall (CVaR)</span>
+                        <p class="text-sm font-bold text-red-500 mt-1">-{var_data['cvar_95_expected_shortfall']} {metric.currency}</p>
+                    </div>
+                </div>
+                <p class="text-[11px] text-gray-400 mt-4 border-t border-gray-800 pt-3">{var_data['risk_summary']}</p>
+            </div>
+
+            <div class="bg-gray-900 border border-gray-800 rounded-lg p-6 mb-6">
+                <h2 class="text-sm font-bold text-emerald-400 uppercase tracking-wider mb-4">2. Algorithmic Momentum Performance (1-Year Backtest)</h2>
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
+                    <div>
+                        <span class="text-gray-500">Strategy Net Return</span>
+                        <p class="text-sm font-bold text-emerald-400 mt-1">{backtest_data.strategy_return_pct}%</p>
+                    </div>
+                    <div>
+                        <span class="text-gray-500">Buy & Hold Return</span>
+                        <p class="text-sm font-bold text-gray-400 mt-1">{backtest_data.buy_and_hold_return_pct}%</p>
+                    </div>
+                    <div>
+                        <span class="text-gray-500">Sharpe Ratio</span>
+                        <p class="text-sm font-bold text-white mt-1">{backtest_data.sharpe_ratio}</p>
+                    </div>
+                    <div>
+                        <span class="text-gray-500">Max Systemic Drawdown</span>
+                        <p class="text-sm font-bold text-red-400 mt-1">{backtest_data.max_drawdown_pct}%</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="text-[10px] text-gray-600 border-t border-gray-800 pt-4 flex justify-between">
+                <span>Generated automatically via AlphaMetrics Engine v4.0</span>
+                <span>Audit Stamp: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</span>
+            </div>
+        </body>
+        </html>
+        """
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
