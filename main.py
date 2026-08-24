@@ -615,3 +615,59 @@ async def serve_dashboard():
     </body>
     </html>
     """
+
+import numpy as np
+
+@app.get("/api/v1/quant/var/{ticker}")
+async def calculate_var_cvar(ticker: str, days: int = 1, simulations: int = 10000):
+    clean_ticker = ticker.strip().upper()
+    cache_key = f"var_cvar:{clean_ticker}:{days}:{simulations}"
+    
+    if redis_client:
+        cached = redis_client.get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+    sym = get_ticker_symbol(clean_ticker)
+    df = yf.download(sym, period="1y", interval="1d", progress=False)
+    
+    if df.empty or len(df) < 50:
+        raise HTTPException(status_code=400, detail="Insufficient historical data for risk simulation.")
+        
+    close_prices = df["Close"].squeeze()
+    daily_returns = close_prices.pct_change().dropna().values
+    
+    mean_return = np.mean(daily_returns)
+    std_dev = np.std(daily_returns)
+    current_price = float(close_prices.iloc[-1])
+    
+    simulated_returns = np.random.normal(
+        (mean_return - 0.5 * std_dev ** 2) * days,
+        std_dev * np.sqrt(days),
+        simulations
+    )
+    simulated_price_changes = current_price * simulated_returns
+    
+    var_95 = float(np.percentile(simulated_price_changes, 5))
+    var_99 = float(np.percentile(simulated_price_changes, 1))
+    
+    cvar_95 = float(simulated_price_changes[simulated_price_changes <= var_95].mean())
+    cvar_99 = float(simulated_price_changes[simulated_price_changes <= var_99].mean())
+    
+    result = {
+        "ticker": clean_ticker,
+        "current_price": current_price,
+        "time_horizon_days": days,
+        "simulations_count": simulations,
+        "volatility_annualized": round(float(std_dev * np.sqrt(252) * 100), 2),
+        "var_95_loss": round(abs(var_95), 2),
+        "var_99_loss": round(abs(var_99), 2),
+        "cvar_95_expected_shortfall": round(abs(cvar_95), 2),
+        "cvar_99_expected_shortfall": round(abs(cvar_99), 2),
+        "risk_interpretation": f"With 95% confidence, the maximum expected loss over {days} day(s) will not exceed {abs(round(var_95, 2))} units."
+    }
+    
+    if redis_client:
+        redis_client.setex(cache_key, 3600, json.dumps(result))
+        
+    return result
