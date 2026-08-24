@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException, Security, status, Depends, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, HTTPException, Security, status, Depends, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -40,7 +41,7 @@ except Exception as e:
 
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
-    version="3.5.0"
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -117,6 +118,30 @@ class BacktestResult(BaseModel):
     total_trades: int
     win_rate_pct: float
     analysis_date: str
+
+class PortfolioRiskAnalysis(BaseModel):
+    assets: List[str]
+    correlation_matrix: dict
+    average_correlation: float
+    diversification_score: str
+    generated_at: str
+
+def log_metric_to_db(ticker: str, price: float, change_24h: float, rsi: float, status_desc: str):
+    try:
+        from database import SessionLocal, AssetMetricHistory
+        db = SessionLocal()
+        record = AssetMetricHistory(
+            ticker=ticker,
+            price=price,
+            change_24h=change_24h,
+            rsi_14=rsi,
+            status=status_desc
+        )
+        db.add(record)
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"DB Ingestion Warning: {e}")
 
 def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
     delta = data.diff()
@@ -301,6 +326,115 @@ def run_quant_backtest_sync(ticker_clean: str) -> BacktestResult:
 
     return res
 
+def run_monte_carlo_var_sync(ticker_clean: str, days: int = 1, simulations: int = 10000) -> dict:
+    cache_key = f"var_cvar:{ticker_clean}:{days}:{simulations}"
+    if REDIS_AVAILABLE and r_client:
+        try:
+            cached = r_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
+
+    fetch_ticker = "GC=F" if ticker_clean == "GRAM-ALTIN-TRY" else ticker_clean
+    stock = yf.Ticker(fetch_ticker)
+    df = stock.history(period="1y", interval="1d")
+    
+    if df.empty or len(df) < 50:
+        raise ValueError(f"Insufficient historical data for {ticker_clean}")
+        
+    close_prices = df["Close"].dropna()
+    daily_returns = close_prices.pct_change().dropna().values
+    
+    mean_return = float(np.mean(daily_returns))
+    std_dev = float(np.std(daily_returns))
+    current_price = float(close_prices.iloc[-1])
+    
+    simulated_returns = np.random.normal(
+        (mean_return - 0.5 * std_dev ** 2) * days,
+        std_dev * np.sqrt(days),
+        simulations
+    )
+    simulated_price_changes = current_price * simulated_returns
+    
+    var_95 = float(np.percentile(simulated_price_changes, 5))
+    var_99 = float(np.percentile(simulated_price_changes, 1))
+    
+    cvar_95 = float(simulated_price_changes[simulated_price_changes <= var_95].mean())
+    cvar_99 = float(simulated_price_changes[simulated_price_changes <= var_99].mean())
+    
+    result = {
+        "ticker": ticker_clean,
+        "current_price": round(current_price, 2),
+        "time_horizon_days": days,
+        "simulations_count": simulations,
+        "volatility_annualized_pct": round(float(std_dev * np.sqrt(252) * 100), 2),
+        "var_95_max_loss": round(abs(var_95), 2),
+        "var_99_max_loss": round(abs(var_99), 2),
+        "cvar_95_expected_shortfall": round(abs(cvar_95), 2),
+        "cvar_99_expected_shortfall": round(abs(cvar_99), 2),
+        "risk_summary": f"With 95% statistical confidence, expected loss over {days} day(s) will not exceed {abs(round(var_95, 2))} units."
+    }
+    
+    if REDIS_AVAILABLE and r_client:
+        try:
+            r_client.setex(cache_key, 3600, json.dumps(result))
+        except Exception:
+            pass
+            
+    return result
+
+def run_correlation_matrix_sync(symbols: List[str]) -> PortfolioRiskAnalysis:
+    cache_key = f"corr_matrix:{'_'.join(sorted(symbols))}"
+    if REDIS_AVAILABLE and r_client:
+        try:
+            cached = r_client.get(cache_key)
+            if cached:
+                return PortfolioRiskAnalysis(**json.loads(cached))
+        except Exception:
+            pass
+
+    price_series = {}
+    for s in symbols:
+        fetch_sym = "GC=F" if s == "GRAM-ALTIN-TRY" else s
+        stock = yf.Ticker(fetch_sym)
+        hist = stock.history(period="6mo", interval="1d")
+        if not hist.empty and len(hist) > 20:
+            price_series[s] = hist["Close"].pct_change().dropna()
+            
+    if len(price_series) < 2:
+        raise ValueError("At least 2 valid symbols with historical data are required.")
+        
+    df_returns = pd.DataFrame(price_series).dropna()
+    corr_df = df_returns.corr().round(3)
+    
+    corr_dict = corr_df.to_dict()
+    corr_values = corr_df.values[np.triu_indices_from(corr_df.values, k=1)]
+    avg_corr = float(np.mean(corr_values)) if len(corr_values) > 0 else 1.0
+    
+    if avg_corr < 0.3:
+        div_score = "Excellent Diversification (Low Systemic Risk)"
+    elif avg_corr < 0.7:
+        div_score = "Moderate Diversification"
+    else:
+        div_score = "High Correlation Risk (Concentrated Portfolio)"
+        
+    res = PortfolioRiskAnalysis(
+        assets=symbols,
+        correlation_matrix=corr_dict,
+        average_correlation=round(avg_corr, 3),
+        diversification_score=div_score,
+        generated_at=datetime.datetime.utcnow().isoformat()
+    )
+    
+    if REDIS_AVAILABLE and r_client:
+        try:
+            r_client.setex(cache_key, 1800, res.model_dump_json())
+        except Exception:
+            pass
+            
+    return res
+
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["Monitoring"])
 async def health_check():
     start_time = time.perf_counter()
@@ -310,15 +444,17 @@ async def health_check():
         "redis_connected": REDIS_AVAILABLE,
         "redis_error": REDIS_ERROR,
         "latency_ms": latency_ms,
-        "version": "3.5.0"
+        "version": "4.0.0"
     }
 
 @app.get("/api/v1/metrics/{ticker}", response_model=MarketRiskMetric)
-async def get_metrics(ticker: str):
+async def get_metrics(ticker: str, background_tasks: BackgroundTasks):
     ticker_clean = ticker.upper()
     try:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, process_single_ticker_sync, ticker_clean)
+        metric = await loop.run_in_executor(None, process_single_ticker_sync, ticker_clean)
+        background_tasks.add_task(log_metric_to_db, metric.ticker, metric.price, metric.change_percent, metric.rsi_14, metric.momentum_status)
+        return metric
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -328,6 +464,26 @@ async def get_backtest(ticker: str):
     try:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, run_quant_backtest_sync, ticker_clean)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/quant/var/{ticker}")
+async def get_var_cvar(ticker: str, days: int = 1, simulations: int = 10000):
+    ticker_clean = ticker.upper()
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, run_monte_carlo_var_sync, ticker_clean, days, simulations)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/quant/correlation", response_model=PortfolioRiskAnalysis)
+async def get_correlation_matrix(symbols: str):
+    raw_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if len(raw_list) < 2:
+        raise HTTPException(status_code=400, detail="Please provide at least 2 comma-separated tickers (e.g. ?symbols=AAPL,TSLA,NVDA)")
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, run_correlation_matrix_sync, raw_list)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -374,7 +530,7 @@ async def serve_dashboard():
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-800 pb-6 mb-6">
                 <div>
                     <h1 class="text-2xl font-bold text-emerald-400 tracking-wide">AlphaMetrics Terminal</h1>
-                    <p class="text-xs text-gray-500 mt-1">Real-Time Risk & Quant Execution Engine</p>
+                    <p class="text-xs text-gray-500 mt-1">Real-Time Risk & Quant Execution Engine (v4.0)</p>
                 </div>
                 <div class="flex items-center gap-2">
                     <span id="connBadge" class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
@@ -405,7 +561,7 @@ async def serve_dashboard():
                                 <th class="py-3.5 px-4">50D Avg</th>
                                 <th class="py-3.5 px-4">14D RSI</th>
                                 <th class="py-3.5 px-4">Status</th>
-                                <th class="py-3.5 px-4 text-right">Quant</th>
+                                <th class="py-3.5 px-4 text-right">Quant Actions</th>
                             </tr>
                         </thead>
                         <tbody id="watchlistBody" class="divide-y divide-gray-800">
@@ -419,9 +575,9 @@ async def serve_dashboard():
             <div class="bg-[#0f172a] border border-gray-800 w-full max-w-lg rounded-xl p-6 relative">
                 <button onclick="closeModal()" class="absolute top-4 right-4 text-gray-400 hover:text-white text-lg font-bold">&times;</button>
                 <div id="modalContent">
-                    <p class="text-xs text-gray-500 uppercase tracking-wider">Algorithmic Backtest Engine</p>
+                    <p class="text-xs text-gray-500 uppercase tracking-wider">Algorithmic Backtest & Risk Engine</p>
                     <h3 id="modalTicker" class="text-xl font-bold text-emerald-400 mt-1">--</h3>
-                    <div id="modalLoading" class="py-8 text-center text-xs text-gray-400 animate-pulse">Running 1-Year Quantitative Simulation...</div>
+                    <div id="modalLoading" class="py-8 text-center text-xs text-gray-400 animate-pulse">Running Quantitative Models...</div>
                     <div id="modalResults" class="hidden mt-4 space-y-3">
                         <div class="grid grid-cols-2 gap-3">
                             <div class="bg-gray-900 p-3 rounded border border-gray-800">
@@ -478,8 +634,8 @@ async def serve_dashboard():
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-right">
-                            <button onclick="openQuantModal('${ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2 py-1 rounded transition">
-                                Quant
+                            <button onclick="openQuantModal('${ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2.5 py-1 rounded transition">
+                                Quant Risk
                             </button>
                         </td>
                     `;
@@ -516,8 +672,8 @@ async def serve_dashboard():
                     </td>
                     <td class="py-3.5 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
                     <td class="py-3.5 px-4 text-right">
-                        <button onclick="openQuantModal('${data.ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2 py-1 rounded transition">
-                            Quant
+                        <button onclick="openQuantModal('${data.ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2.5 py-1 rounded transition">
+                            Quant Risk
                         </button>
                     </td>
                 `;
@@ -597,7 +753,7 @@ async def serve_dashboard():
                     loading.classList.add('hidden');
                     results.classList.remove('hidden');
                 } catch {
-                    loading.innerText = 'Backtest calculation failed for this asset.';
+                    loading.innerText = 'Risk calculation failed for this asset.';
                 }
             }
 
@@ -615,59 +771,3 @@ async def serve_dashboard():
     </body>
     </html>
     """
-
-import numpy as np
-
-@app.get("/api/v1/quant/var/{ticker}")
-async def calculate_var_cvar(ticker: str, days: int = 1, simulations: int = 10000):
-    clean_ticker = ticker.strip().upper()
-    cache_key = f"var_cvar:{clean_ticker}:{days}:{simulations}"
-    
-    if redis_client:
-        cached = redis_client.get(cache_key)
-        if cached:
-            return json.loads(cached)
-
-    sym = get_ticker_symbol(clean_ticker)
-    df = yf.download(sym, period="1y", interval="1d", progress=False)
-    
-    if df.empty or len(df) < 50:
-        raise HTTPException(status_code=400, detail="Insufficient historical data for risk simulation.")
-        
-    close_prices = df["Close"].squeeze()
-    daily_returns = close_prices.pct_change().dropna().values
-    
-    mean_return = np.mean(daily_returns)
-    std_dev = np.std(daily_returns)
-    current_price = float(close_prices.iloc[-1])
-    
-    simulated_returns = np.random.normal(
-        (mean_return - 0.5 * std_dev ** 2) * days,
-        std_dev * np.sqrt(days),
-        simulations
-    )
-    simulated_price_changes = current_price * simulated_returns
-    
-    var_95 = float(np.percentile(simulated_price_changes, 5))
-    var_99 = float(np.percentile(simulated_price_changes, 1))
-    
-    cvar_95 = float(simulated_price_changes[simulated_price_changes <= var_95].mean())
-    cvar_99 = float(simulated_price_changes[simulated_price_changes <= var_99].mean())
-    
-    result = {
-        "ticker": clean_ticker,
-        "current_price": current_price,
-        "time_horizon_days": days,
-        "simulations_count": simulations,
-        "volatility_annualized": round(float(std_dev * np.sqrt(252) * 100), 2),
-        "var_95_loss": round(abs(var_95), 2),
-        "var_99_loss": round(abs(var_99), 2),
-        "cvar_95_expected_shortfall": round(abs(cvar_95), 2),
-        "cvar_99_expected_shortfall": round(abs(cvar_99), 2),
-        "risk_interpretation": f"With 95% confidence, the maximum expected loss over {days} day(s) will not exceed {abs(round(var_95, 2))} units."
-    }
-    
-    if redis_client:
-        redis_client.setex(cache_key, 3600, json.dumps(result))
-        
-    return result
