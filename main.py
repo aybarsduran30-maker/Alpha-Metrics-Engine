@@ -134,11 +134,11 @@ def log_metric_to_db(ticker: str, price: float, change_24h: float, rsi: float, s
         from database import SessionLocal, AssetMetricHistory
         db = SessionLocal()
         record = AssetMetricHistory(
-            ticker=ticker,
+            symbol=ticker,
             price=price,
             change_24h=change_24h,
-            rsi_14=rsi,
-            status=status_desc
+            fourteen_d_rsi=rsi,
+            risk_status=status_desc
         )
         db.add(record)
         db.commit()
