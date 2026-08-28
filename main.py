@@ -503,6 +503,26 @@ async def health_check():
     status_code=status.HTTP_201_CREATED,
     tags=["B2B Auth"],
 )
+@app.get(
+    "/api/v1/auth/usage",
+    tags=["B2B Auth"],
+    status_code=status.HTTP_200_OK,
+)
+def get_client_usage(
+    client: ApiClient = Depends(verify_api_key),
+    db: Session = Depends(get_db)
+):
+    remaining = max(0, client.monthly_quota - client.used_requests_this_month)
+    return {
+        "company": client.company_name,
+        "plan_tier": client.plan_tier,
+        "rate_limit_per_min": client.rate_limit_per_min,
+        "monthly_quota": client.monthly_quota,
+        "used_requests": client.used_requests_this_month,
+        "remaining_requests": remaining,
+        "status": "active" if client.is_active else "inactive"
+    }
+    
 def register_client(
     payload: ClientRegisterSchema, db: Session = Depends(get_db)
 ):
