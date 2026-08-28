@@ -73,429 +73,429 @@ app.add_middleware(
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-  if request.url.path in ["/health", "/docs", "/openapi.json", "/"]:
+    if request.url.path in ["/health", "/docs", "/openapi.json", "/"]:
+        return await call_next(request)
+
+    if REDIS_AVAILABLE and r_client:
+        client_ip = request.client.host if request.client else "unknown"
+        window = int(time.time()) // 60
+        key = f"rate_limit:{client_ip}:{window}"
+
+        try:
+            pipe = r_client.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, 60)
+            results = pipe.execute()
+            request_count = results[0]
+
+            if request_count > 60:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Rate limit exceeded. Maximum 60 requests per minute.",
+                )
+        except HTTPException as http_exc:
+            raise http_exc
+        except Exception:
+            pass
+
     return await call_next(request)
-
-  if REDIS_AVAILABLE and r_client:
-    client_ip = request.client.host if request.client else "unknown"
-    window = int(time.time()) // 60
-    key = f"rate_limit:{client_ip}:{window}"
-
-    try:
-      pipe = r_client.pipeline()
-      pipe.incr(key)
-      pipe.expire(key, 60)
-      results = pipe.execute()
-      request_count = results[0]
-
-      if request_count > 60:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded. Maximum 60 requests per minute.",
-        )
-    except HTTPException as http_exc:
-      raise http_exc
-    except Exception:
-      pass
-
-  return await call_next(request)
 
 
 class ClientRegisterSchema(BaseModel):
-  company_name: str
-  email:str
-  tier: str = "starter"
+    company_name: str
+    email: str
+    tier: str = "starter"
 
 
 class MarketRiskMetric(BaseModel):
-  ticker: str
-  price: float
-  change_percent: float
-  currency: str
-  fifty_day_average: float
-  rsi_14: float
-  momentum_status: str
-  generated_at: str
-  cache_hit: bool = False
+    ticker: str
+    price: float
+    change_percent: float
+    currency: str
+    fifty_day_average: float
+    rsi_14: float
+    momentum_status: str
+    generated_at: str
+    cache_hit: bool = False
 
 
 class BacktestResult(BaseModel):
-  ticker: str
-  period: str
-  strategy_return_pct: float
-  buy_and_hold_return_pct: float
-  sharpe_ratio: float
-  max_drawdown_pct: float
-  total_trades: int
-  win_rate_pct: float
-  analysis_date: str
+    ticker: str
+    period: str
+    strategy_return_pct: float
+    buy_and_hold_return_pct: float
+    sharpe_ratio: float
+    max_drawdown_pct: float
+    total_trades: int
+    win_rate_pct: float
+    analysis_date: str
 
 
 class PortfolioRiskAnalysis(BaseModel):
-  assets: List[str]
-  correlation_matrix: dict
-  average_correlation: float
-  diversification_score: str
-  generated_at: str
+    assets: List[str]
+    correlation_matrix: dict
+    average_correlation: float
+    diversification_score: str
+    generated_at: str
 
 
 def log_metric_to_db(
     ticker: str, price: float, change_24h: float, rsi: float, status_desc: str
 ):
-  try:
-    from database import AssetMetricHistory, SessionLocal
+    try:
+        from database import AssetMetricHistory, SessionLocal
 
-    db = SessionLocal()
-    record = AssetMetricHistory(
-        symbol=ticker,
-        price=price,
-        change_24h=change_24h,
-        fourteen_d_rsi=rsi,
-        risk_status=status_desc,
-    )
-    db.add(record)
-    db.commit()
-    db.close()
-  except Exception as e:
-    print(f"DB Ingestion Warning: {e}")
+        db = SessionLocal()
+        record = AssetMetricHistory(
+            symbol=ticker,
+            price=price,
+            change_24h=change_24h,
+            fourteen_d_rsi=rsi,
+            risk_status=status_desc,
+        )
+        db.add(record)
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"DB Ingestion Warning: {e}")
 
 
 def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
-  delta = data.diff()
-  gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-  loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-  rs = gain / loss
-  rsi = 100 - (100 / (1 + rs))
-  return rsi
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 
 def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
-  cache_key = f"market:{ticker_clean}"
-  if REDIS_AVAILABLE and r_client:
-    try:
-      cached_data = r_client.get(cache_key)
-      if cached_data:
-        parsed = json.loads(cached_data)
-        parsed["cache_hit"] = True
-        return MarketRiskMetric(**parsed)
-    except Exception:
-      pass
+    cache_key = f"market:{ticker_clean}"
+    if REDIS_AVAILABLE and r_client:
+        try:
+            cached_data = r_client.get(cache_key)
+            if cached_data:
+                parsed = json.loads(cached_data)
+                parsed["cache_hit"] = True
+                return MarketRiskMetric(**parsed)
+        except Exception:
+            pass
 
-  if ticker_clean == "GRAM-ALTIN-TRY":
-    gold = yf.Ticker("GC=F")
-    usdtry = yf.Ticker("USDTRY=X")
+    if ticker_clean == "GRAM-ALTIN-TRY":
+        gold = yf.Ticker("GC=F")
+        usdtry = yf.Ticker("USDTRY=X")
 
-    gold_hist = gold.history(period="1mo", interval="1d")
-    usd_hist = usdtry.history(period="1mo", interval="1d")
+        gold_hist = gold.history(period="1mo", interval="1d")
+        usd_hist = usdtry.history(period="1mo", interval="1d")
 
-    if gold_hist.empty or usd_hist.empty:
-      raise ValueError("Synthetic gold data unavailable")
+        if gold_hist.empty or usd_hist.empty:
+            raise ValueError("Synthetic gold data unavailable")
 
-    gold_close = gold_hist["Close"].ffill()
-    usd_close = usd_hist["Close"].ffill()
+        gold_close = gold_hist["Close"].ffill()
+        usd_close = usd_hist["Close"].ffill()
 
-    latest_gold = float(gold_close.iloc[-1])
-    prev_gold = (
-        float(gold_close.iloc[-2]) if len(gold_close) >= 2 else latest_gold
-    )
-    latest_usd = float(usd_close.iloc[-1])
-    prev_usd = float(usd_close.iloc[-2]) if len(usd_close) >= 2 else latest_usd
+        latest_gold = float(gold_close.iloc[-1])
+        prev_gold = (
+            float(gold_close.iloc[-2]) if len(gold_close) >= 2 else latest_gold
+        )
+        latest_usd = float(usd_close.iloc[-1])
+        prev_usd = float(usd_close.iloc[-2]) if len(usd_close) >= 2 else latest_usd
 
-    current_price = (latest_gold * latest_usd) / 31.1034768
-    prev_price = (prev_gold * prev_usd) / 31.1034768
-    change_pct = round(((current_price - prev_price) / prev_price) * 100, 2)
+        current_price = (latest_gold * latest_usd) / 31.1034768
+        prev_price = (prev_gold * prev_usd) / 31.1034768
+        change_pct = round(((current_price - prev_price) / prev_price) * 100, 2)
 
-    res_obj = MarketRiskMetric(
-        ticker="GRAM-ALTIN-TRY",
-        price=round(current_price, 2),
-        change_percent=change_pct,
-        currency="TRY",
-        fifty_day_average=round(current_price * 0.96, 2),
-        rsi_14=62.4,
-        momentum_status="Neutral",
-        generated_at=datetime.datetime.utcnow().isoformat(),
-        cache_hit=False,
-    )
-  else:
-    stock = yf.Ticker(ticker_clean)
-    hist = stock.history(period="1mo", interval="1d")
-
-    if hist.empty or len(hist) < 2:
-      raise ValueError(f"Insufficient data for {ticker_clean}")
-
-    current_price = float(hist["Close"].iloc[-1])
-    prev_close = float(hist["Close"].iloc[-2])
-    change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
-
-    rsi_series = calculate_rsi(hist["Close"], period=14)
-    last_rsi = (
-        float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
-    )
-    rsi_val = round(last_rsi, 2)
-
-    info = stock.fast_info
-    fifty_avg = (
-        float(info.fifty_day_average)
-        if info.fifty_day_average
-        else current_price
-    )
-    currency = str(info.currency) if info.currency else "USD"
-
-    if rsi_val >= 70:
-      status_desc = "Overbought"
-    elif rsi_val <= 30:
-      status_desc = "Oversold"
+        res_obj = MarketRiskMetric(
+            ticker="GRAM-ALTIN-TRY",
+            price=round(current_price, 2),
+            change_percent=change_pct,
+            currency="TRY",
+            fifty_day_average=round(current_price * 0.96, 2),
+            rsi_14=62.4,
+            momentum_status="Neutral",
+            generated_at=datetime.datetime.utcnow().isoformat(),
+            cache_hit=False,
+        )
     else:
-      status_desc = "Neutral"
+        stock = yf.Ticker(ticker_clean)
+        hist = stock.history(period="1mo", interval="1d")
 
-    res_obj = MarketRiskMetric(
-        ticker=ticker_clean,
-        price=round(current_price, 2),
-        change_percent=change_pct,
-        currency=currency,
-        fifty_day_average=round(fifty_avg, 2),
-        rsi_14=rsi_val,
-        momentum_status=status_desc,
-        generated_at=datetime.datetime.utcnow().isoformat(),
-        cache_hit=False,
-    )
+        if hist.empty or len(hist) < 2:
+            raise ValueError(f"Insufficient data for {ticker_clean}")
 
-  if REDIS_AVAILABLE and r_client:
-    try:
-      r_client.setex(cache_key, 60, res_obj.model_dump_json())
-    except Exception:
-      pass
+        current_price = float(hist["Close"].iloc[-1])
+        prev_close = float(hist["Close"].iloc[-2])
+        change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
 
-  return res_obj
+        rsi_series = calculate_rsi(hist["Close"], period=14)
+        last_rsi = (
+            float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
+        )
+        rsi_val = round(last_rsi, 2)
+
+        info = stock.fast_info
+        fifty_avg = (
+            float(info.fifty_day_average)
+            if info.fifty_day_average
+            else current_price
+        )
+        currency = str(info.currency) if info.currency else "USD"
+
+        if rsi_val >= 70:
+            status_desc = "Overbought"
+        elif rsi_val <= 30:
+            status_desc = "Oversold"
+        else:
+            status_desc = "Neutral"
+
+        res_obj = MarketRiskMetric(
+            ticker=ticker_clean,
+            price=round(current_price, 2),
+            change_percent=change_pct,
+            currency=currency,
+            fifty_day_average=round(fifty_avg, 2),
+            rsi_14=rsi_val,
+            momentum_status=status_desc,
+            generated_at=datetime.datetime.utcnow().isoformat(),
+            cache_hit=False,
+        )
+
+    if REDIS_AVAILABLE and r_client:
+        try:
+            r_client.setex(cache_key, 60, res_obj.model_dump_json())
+        except Exception:
+            pass
+
+    return res_obj
 
 
 def run_quant_backtest_sync(ticker_clean: str) -> BacktestResult:
-  cache_key = f"backtest:{ticker_clean}"
-  if REDIS_AVAILABLE and r_client:
-    try:
-      cached_data = r_client.get(cache_key)
-      if cached_data:
-        return BacktestResult(**json.loads(cached_data))
-    except Exception:
-      pass
+    cache_key = f"backtest:{ticker_clean}"
+    if REDIS_AVAILABLE and r_client:
+        try:
+            cached_data = r_client.get(cache_key)
+            if cached_data:
+                return BacktestResult(**json.loads(cached_data))
+        except Exception:
+            pass
 
-  fetch_ticker = "GC=F" if ticker_clean == "GRAM-ALTIN-TRY" else ticker_clean
-  stock = yf.Ticker(fetch_ticker)
-  df = stock.history(period="1y", interval="1d")
+    fetch_ticker = "GC=F" if ticker_clean == "GRAM-ALTIN-TRY" else ticker_clean
+    stock = yf.Ticker(fetch_ticker)
+    df = stock.history(period="1y", interval="1d")
 
-  if df.empty or len(df) < 50:
-    raise ValueError(f"Insufficient history data for {ticker_clean}")
+    if df.empty or len(df) < 50:
+        raise ValueError(f"Insufficient history data for {ticker_clean}")
 
-  df["RSI"] = calculate_rsi(df["Close"], period=14)
-  df["Daily_Return"] = df["Close"].pct_change().fillna(0)
+    df["RSI"] = calculate_rsi(df["Close"], period=14)
+    df["Daily_Return"] = df["Close"].pct_change().fillna(0)
 
-  position = 0
-  trades = []
-  strategy_returns = []
-  entry_price = 0.0
+    position = 0
+    trades = []
+    strategy_returns = []
+    entry_price = 0.0
 
-  for i in range(len(df)):
-    rsi = df["RSI"].iloc[i]
-    price = df["Close"].iloc[i]
+    for i in range(len(df)):
+        rsi = df["RSI"].iloc[i]
+        price = df["Close"].iloc[i]
 
-    if position == 0 and rsi < 35:
-      position = 1
-      entry_price = price
-    elif position == 1 and rsi > 65:
-      position = 0
-      ret = (price - entry_price) / entry_price
-      trades.append(ret)
+        if position == 0 and rsi < 35:
+            position = 1
+            entry_price = price
+        elif position == 1 and rsi > 65:
+            position = 0
+            ret = (price - entry_price) / entry_price
+            trades.append(ret)
 
-    if position == 1:
-      strategy_returns.append(df["Daily_Return"].iloc[i])
+        if position == 1:
+            strategy_returns.append(df["Daily_Return"].iloc[i])
+        else:
+            strategy_returns.append(0.0)
+
+    df["Strategy_Return"] = strategy_returns
+    df["Cum_Strategy"] = (1 + df["Strategy_Return"]).cumprod()
+    df["Cum_BnH"] = (1 + df["Daily_Return"]).cumprod()
+
+    total_strat_return = round(
+        (float(df["Cum_Strategy"].iloc[-1]) - 1.0) * 100, 2
+    )
+    total_bnh_return = round((float(df["Cum_BnH"].iloc[-1]) - 1.0) * 100, 2)
+
+    active_returns = df.loc[df["Strategy_Return"] != 0, "Strategy_Return"]
+    if len(active_returns) > 5 and active_returns.std() > 0:
+        sharpe = (active_returns.mean() / active_returns.std()) * np.sqrt(252)
+        sharpe_val = round(float(sharpe), 2)
     else:
-      strategy_returns.append(0.0)
+        sharpe_val = 0.0
 
-  df["Strategy_Return"] = strategy_returns
-  df["Cum_Strategy"] = (1 + df["Strategy_Return"]).cumprod()
-  df["Cum_BnH"] = (1 + df["Daily_Return"]).cumprod()
+    rolling_max = df["Cum_Strategy"].cummax()
+    drawdown = (df["Cum_Strategy"] - rolling_max) / rolling_max
+    max_dd = round(float(drawdown.min()) * 100, 2)
 
-  total_strat_return = round(
-      (float(df["Cum_Strategy"].iloc[-1]) - 1.0) * 100, 2
-  )
-  total_bnh_return = round((float(df["Cum_BnH"].iloc[-1]) - 1.0) * 100, 2)
+    total_trades = len(trades)
+    wins = [t for t in trades if t > 0]
+    win_rate = (
+        round((len(wins) / total_trades) * 100, 2) if total_trades > 0 else 0.0
+    )
 
-  active_returns = df.loc[df["Strategy_Return"] != 0, "Strategy_Return"]
-  if len(active_returns) > 5 and active_returns.std() > 0:
-    sharpe = (active_returns.mean() / active_returns.std()) * np.sqrt(252)
-    sharpe_val = round(float(sharpe), 2)
-  else:
-    sharpe_val = 0.0
+    res = BacktestResult(
+        ticker=ticker_clean,
+        period="1 Year",
+        strategy_return_pct=total_strat_return,
+        buy_and_hold_return_pct=total_bnh_return,
+        sharpe_ratio=sharpe_val,
+        max_drawdown_pct=max_dd,
+        total_trades=total_trades,
+        win_rate_pct=win_rate,
+        analysis_date=datetime.datetime.utcnow().isoformat(),
+    )
 
-  rolling_max = df["Cum_Strategy"].cummax()
-  drawdown = (df["Cum_Strategy"] - rolling_max) / rolling_max
-  max_dd = round(float(drawdown.min()) * 100, 2)
+    if REDIS_AVAILABLE and r_client:
+        try:
+            r_client.setex(cache_key, 300, res.model_dump_json())
+        except Exception:
+            pass
 
-  total_trades = len(trades)
-  wins = [t for t in trades if t > 0]
-  win_rate = (
-      round((len(wins) / total_trades) * 100, 2) if total_trades > 0 else 0.0
-  )
-
-  res = BacktestResult(
-      ticker=ticker_clean,
-      period="1 Year",
-      strategy_return_pct=total_strat_return,
-      buy_and_hold_return_pct=total_bnh_return,
-      sharpe_ratio=sharpe_val,
-      max_drawdown_pct=max_dd,
-      total_trades=total_trades,
-      win_rate_pct=win_rate,
-      analysis_date=datetime.datetime.utcnow().isoformat(),
-  )
-
-  if REDIS_AVAILABLE and r_client:
-    try:
-      r_client.setex(cache_key, 300, res.model_dump_json())
-    except Exception:
-      pass
-
-  return res
+    return res
 
 
 def run_monte_carlo_var_sync(
     ticker_clean: str, days: int = 1, simulations: int = 10000
 ) -> dict:
-  cache_key = f"var_cvar:{ticker_clean}:{days}:{simulations}"
-  if REDIS_AVAILABLE and r_client:
-    try:
-      cached = r_client.get(cache_key)
-      if cached:
-        return json.loads(cached)
-    except Exception:
-      pass
+    cache_key = f"var_cvar:{ticker_clean}:{days}:{simulations}"
+    if REDIS_AVAILABLE and r_client:
+        try:
+            cached = r_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
 
-  fetch_ticker = "GC=F" if ticker_clean == "GRAM-ALTIN-TRY" else ticker_clean
-  stock = yf.Ticker(fetch_ticker)
-  df = stock.history(period="1y", interval="1d")
+    fetch_ticker = "GC=F" if ticker_clean == "GRAM-ALTIN-TRY" else ticker_clean
+    stock = yf.Ticker(fetch_ticker)
+    df = stock.history(period="1y", interval="1d")
 
-  if df.empty or len(df) < 50:
-    raise ValueError(
-        "Insufficient historical data or upstream rate limited for"
-        f" {ticker_clean}"
+    if df.empty or len(df) < 50:
+        raise ValueError(
+            "Insufficient historical data or upstream rate limited for"
+            f" {ticker_clean}"
+        )
+
+    close_prices = df["Close"].ffill().dropna()
+    daily_returns = close_prices.pct_change().dropna().values
+
+    mean_return = float(np.mean(daily_returns))
+    std_dev = float(np.std(daily_returns))
+    current_price = float(close_prices.iloc[-1])
+
+    simulated_returns = np.random.normal(
+        (mean_return - 0.5 * std_dev**2) * days,
+        std_dev * np.sqrt(days),
+        simulations,
+    )
+    simulated_price_changes = current_price * simulated_returns
+
+    var_95 = float(np.percentile(simulated_price_changes, 5))
+    var_99 = float(np.percentile(simulated_price_changes, 1))
+
+    cvar_95 = float(
+        simulated_price_changes[simulated_price_changes <= var_95].mean()
+    )
+    cvar_99 = float(
+        simulated_price_changes[simulated_price_changes <= var_99].mean()
     )
 
-  close_prices = df["Close"].ffill().dropna()
-  daily_returns = close_prices.pct_change().dropna().values
+    result = {
+        "ticker": ticker_clean,
+        "current_price": round(current_price, 2),
+        "time_horizon_days": days,
+        "simulations_count": simulations,
+        "volatility_annualized_pct": round(
+            float(std_dev * np.sqrt(252) * 100), 2
+        ),
+        "var_95_max_loss": round(abs(var_95), 2),
+        "var_99_max_loss": round(abs(var_99), 2),
+        "cvar_95_expected_shortfall": round(abs(cvar_95), 2),
+        "cvar_99_expected_shortfall": round(abs(cvar_99), 2),
+        "risk_summary": (
+            f"With 95% statistical confidence, expected loss over {days} day(s)"
+            f" will not exceed {abs(round(var_95, 2))} units."
+        ),
+    }
 
-  mean_return = float(np.mean(daily_returns))
-  std_dev = float(np.std(daily_returns))
-  current_price = float(close_prices.iloc[-1])
+    if REDIS_AVAILABLE and r_client:
+        try:
+            r_client.setex(cache_key, 3600, json.dumps(result))
+        except Exception:
+            pass
 
-  simulated_returns = np.random.normal(
-      (mean_return - 0.5 * std_dev**2) * days,
-      std_dev * np.sqrt(days),
-      simulations,
-  )
-  simulated_price_changes = current_price * simulated_returns
-
-  var_95 = float(np.percentile(simulated_price_changes, 5))
-  var_99 = float(np.percentile(simulated_price_changes, 1))
-
-  cvar_95 = float(
-      simulated_price_changes[simulated_price_changes <= var_95].mean()
-  )
-  cvar_99 = float(
-      simulated_price_changes[simulated_price_changes <= var_99].mean()
-  )
-
-  result = {
-      "ticker": ticker_clean,
-      "current_price": round(current_price, 2),
-      "time_horizon_days": days,
-      "simulations_count": simulations,
-      "volatility_annualized_pct": round(
-          float(std_dev * np.sqrt(252) * 100), 2
-      ),
-      "var_95_max_loss": round(abs(var_95), 2),
-      "var_99_max_loss": round(abs(var_99), 2),
-      "cvar_95_expected_shortfall": round(abs(cvar_95), 2),
-      "cvar_99_expected_shortfall": round(abs(cvar_99), 2),
-      "risk_summary": (
-          f"With 95% statistical confidence, expected loss over {days} day(s)"
-          f" will not exceed {abs(round(var_95, 2))} units."
-      ),
-  }
-
-  if REDIS_AVAILABLE and r_client:
-    try:
-      r_client.setex(cache_key, 3600, json.dumps(result))
-    except Exception:
-      pass
-
-  return result
+    return result
 
 
 def run_correlation_matrix_sync(symbols: List[str]) -> PortfolioRiskAnalysis:
-  cache_key = f"corr_matrix:{'_'.join(sorted(symbols))}"
-  if REDIS_AVAILABLE and r_client:
-    try:
-      cached = r_client.get(cache_key)
-      if cached:
-        return PortfolioRiskAnalysis(**json.loads(cached))
-    except Exception:
-      pass
+    cache_key = f"corr_matrix:{'_'.join(sorted(symbols))}"
+    if REDIS_AVAILABLE and r_client:
+        try:
+            cached = r_client.get(cache_key)
+            if cached:
+                return PortfolioRiskAnalysis(**json.loads(cached))
+        except Exception:
+            pass
 
-  price_series = {}
-  for s in symbols:
-    fetch_sym = "GC=F" if s == "GRAM-ALTIN-TRY" else s
-    stock = yf.Ticker(fetch_sym)
-    hist = stock.history(period="6mo", interval="1d")
-    if not hist.empty and len(hist) > 20:
-      price_series[s] = hist["Close"].pct_change().dropna()
+    price_series = {}
+    for s in symbols:
+        fetch_sym = "GC=F" if s == "GRAM-ALTIN-TRY" else s
+        stock = yf.Ticker(fetch_sym)
+        hist = stock.history(period="6mo", interval="1d")
+        if not hist.empty and len(hist) > 20:
+            price_series[s] = hist["Close"].pct_change().dropna()
 
-  if len(price_series) < 2:
-    raise ValueError(
-        "At least 2 valid symbols with historical data are required."
+    if len(price_series) < 2:
+        raise ValueError(
+            "At least 2 valid symbols with historical data are required."
+        )
+
+    df_returns = pd.DataFrame(price_series).dropna()
+    corr_df = df_returns.corr().round(3)
+
+    corr_dict = corr_df.to_dict()
+    corr_values = corr_df.values[np.triu_indices_from(corr_df.values, k=1)]
+    avg_corr = float(np.mean(corr_values)) if len(corr_values) > 0 else 1.0
+
+    if avg_corr < 0.3:
+        div_score = "Excellent Diversification (Low Systemic Risk)"
+    elif avg_corr < 0.7:
+        div_score = "Moderate Diversification"
+    else:
+        div_score = "High Correlation Risk (Concentrated Portfolio)"
+
+    res = PortfolioRiskAnalysis(
+        assets=symbols,
+        correlation_matrix=corr_dict,
+        average_correlation=round(avg_corr, 3),
+        diversification_score=div_score,
+        generated_at=datetime.datetime.utcnow().isoformat(),
     )
 
-  df_returns = pd.DataFrame(price_series).dropna()
-  corr_df = df_returns.corr().round(3)
+    if REDIS_AVAILABLE and r_client:
+        try:
+            r_client.setex(cache_key, 1800, res.model_dump_json())
+        except Exception:
+            pass
 
-  corr_dict = corr_df.to_dict()
-  corr_values = corr_df.values[np.triu_indices_from(corr_df.values, k=1)]
-  avg_corr = float(np.mean(corr_values)) if len(corr_values) > 0 else 1.0
-
-  if avg_corr < 0.3:
-    div_score = "Excellent Diversification (Low Systemic Risk)"
-  elif avg_corr < 0.7:
-    div_score = "Moderate Diversification"
-  else:
-    div_score = "High Correlation Risk (Concentrated Portfolio)"
-
-  res = PortfolioRiskAnalysis(
-      assets=symbols,
-      correlation_matrix=corr_dict,
-      average_correlation=round(avg_corr, 3),
-      diversification_score=div_score,
-      generated_at=datetime.datetime.utcnow().isoformat(),
-  )
-
-  if REDIS_AVAILABLE and r_client:
-    try:
-      r_client.setex(cache_key, 1800, res.model_dump_json())
-    except Exception:
-      pass
-
-  return res
+    return res
 
 
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["Monitoring"])
 async def health_check():
-  start_time = time.perf_counter()
-  latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
-  return {
-      "status": "operational",
-      "redis_connected": REDIS_AVAILABLE,
-      "redis_error": REDIS_ERROR,
-      "latency_ms": latency_ms,
-      "version": "4.0.0",
-  }
+    start_time = time.perf_counter()
+    latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    return {
+        "status": "operational",
+        "redis_connected": REDIS_AVAILABLE,
+        "redis_error": REDIS_ERROR,
+        "latency_ms": latency_ms,
+        "version": "4.0.0",
+    }
 
 
 @app.post(
@@ -503,26 +503,6 @@ async def health_check():
     status_code=status.HTTP_201_CREATED,
     tags=["B2B Auth"],
 )
-@app.get(
-    "/api/v1/auth/usage",
-    tags=["B2B Auth"],
-    status_code=status.HTTP_200_OK,
-)
-def get_client_usage(
-    client: ApiClient = Depends(verify_api_key),
-    db: Session = Depends(get_db)
-):
-    remaining = max(0, client.monthly_quota - client.used_requests_this_month)
-    return {
-        "company": client.company_name,
-        "plan_tier": client.plan_tier,
-        "rate_limit_per_min": client.rate_limit_per_min,
-        "monthly_quota": client.monthly_quota,
-        "used_requests": client.used_requests_this_month,
-        "remaining_requests": remaining,
-        "status": "active" if client.is_active else "inactive"
-    }
-    
 def register_client(
     payload: ClientRegisterSchema, db: Session = Depends(get_db)
 ):
@@ -561,79 +541,29 @@ def register_client(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Registration failed: {str(e)}"
+            detail=f"Registration failed: {str(e)}",
         )
-def register_client(
-    payload: ClientRegisterSchema, db: Session = Depends(get_db)
-):
-    try:
-        ApiClient.__table__.create(bind=engine, checkfirst=True)
-        
-        tier_quotas = {
-            "starter": {"rpm": 60, "quota": 50000},
-            "pro": {"rpm": 300, "quota": 500000},
-            "enterprise": {"rpm": 1200, "quota": 5000000},
-        }
-        config = tier_quotas.get(payload.tier.lower(), tier_quotas["starter"])
 
-        key = generate_api_key(payload.tier.lower())
-        client = ApiClient(
-            company_name=payload.company_name,
-            email=payload.email,
-            api_key=key,
-            plan_tier=payload.tier.lower(),
-            rate_limit_per_min=config["rpm"],
-            monthly_quota=config["quota"],
-            used_requests_this_month=0,
-            is_active=True
-        )
-        db.add(client)
-        db.commit()
-        db.refresh(client)
-        return {
-            "status": "success",
-            "company": client.company_name,
-            "email": client.email,
-            "api_key": client.api_key,
-            "tier": client.plan_tier,
-            "monthly_quota": client.monthly_quota,
-        }
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Registration failed: {str(e)}"
-        )
-def register_client(
-    payload: ClientRegisterSchema, db: Session = Depends(get_db)
-):
-  tier_quotas = {
-      "starter": {"rpm": 60, "quota": 50000},
-      "pro": {"rpm": 300, "quota": 500000},
-      "enterprise": {"rpm": 1200, "quota": 5000000},
-  }
-  config = tier_quotas.get(payload.tier.lower(), tier_quotas["starter"])
 
-  key = generate_api_key(payload.tier.lower())
-  client = ApiClient(
-      company_name=payload.company_name,
-      email=payload.email,
-      api_key=key,
-      plan_tier=payload.tier.lower(),
-      rate_limit_per_min=config["rpm"],
-      monthly_quota=config["quota"],
-  )
-  db.add(client)
-  db.commit()
-  db.refresh(client)
-  return {
-      "status": "success",
-      "company": client.company_name,
-      "email": client.email,
-      "api_key": client.api_key,
-      "tier": client.plan_tier,
-      "monthly_quota": client.monthly_quota,
-  }
+@app.get(
+    "/api/v1/auth/usage",
+    tags=["B2B Auth"],
+    status_code=status.HTTP_200_OK,
+)
+def get_client_usage(
+    client: ApiClient = Depends(verify_api_key),
+    db: Session = Depends(get_db),
+):
+    remaining = max(0, client.monthly_quota - (client.used_requests_this_month or 0))
+    return {
+        "company": client.company_name,
+        "plan_tier": client.plan_tier,
+        "rate_limit_per_min": client.rate_limit_per_min,
+        "monthly_quota": client.monthly_quota,
+        "used_requests": client.used_requests_this_month or 0,
+        "remaining_requests": remaining,
+        "status": "active" if client.is_active else "inactive",
+    }
 
 
 @app.get(
@@ -647,26 +577,26 @@ async def get_metrics(
     client: ApiClient = Depends(verify_api_key),
     db: Session = Depends(get_db),
 ):
-  client.used_requests_this_month += 1
-  db.commit()
+    client.used_requests_this_month += 1
+    db.commit()
 
-  ticker_clean = ticker.upper()
-  try:
-    loop = asyncio.get_event_loop()
-    metric = await loop.run_in_executor(
-        None, process_single_ticker_sync, ticker_clean
-    )
-    background_tasks.add_task(
-        log_metric_to_db,
-        metric.ticker,
-        metric.price,
-        metric.change_percent,
-        metric.rsi_14,
-        metric.momentum_status,
-    )
-    return metric
-  except Exception as e:
-    raise HTTPException(status_code=500, detail=str(e))
+    ticker_clean = ticker.upper()
+    try:
+        loop = asyncio.get_event_loop()
+        metric = await loop.run_in_executor(
+            None, process_single_ticker_sync, ticker_clean
+        )
+        background_tasks.add_task(
+            log_metric_to_db,
+            metric.ticker,
+            metric.price,
+            metric.change_percent,
+            metric.rsi_14,
+            metric.momentum_status,
+        )
+        return metric
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get(
@@ -679,17 +609,17 @@ async def get_backtest(
     client: ApiClient = Depends(verify_api_key),
     db: Session = Depends(get_db),
 ):
-  client.used_requests_this_month += 1
-  db.commit()
+    client.used_requests_this_month += 1
+    db.commit()
 
-  ticker_clean = ticker.upper()
-  try:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, run_quant_backtest_sync, ticker_clean
-    )
-  except Exception as e:
-    raise HTTPException(status_code=500, detail=str(e))
+    ticker_clean = ticker.upper()
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, run_quant_backtest_sync, ticker_clean
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/v1/quant/var/{ticker}", tags=["B2B Endpoints"])
@@ -700,17 +630,17 @@ async def get_var_cvar(
     client: ApiClient = Depends(verify_api_key),
     db: Session = Depends(get_db),
 ):
-  client.used_requests_this_month += 1
-  db.commit()
+    client.used_requests_this_month += 1
+    db.commit()
 
-  ticker_clean = ticker.upper()
-  try:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, run_monte_carlo_var_sync, ticker_clean, days, simulations
-    )
-  except Exception as e:
-    raise HTTPException(status_code=500, detail=str(e))
+    ticker_clean = ticker.upper()
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, run_monte_carlo_var_sync, ticker_clean, days, simulations
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get(
@@ -723,60 +653,60 @@ async def get_correlation_matrix(
     client: ApiClient = Depends(verify_api_key),
     db: Session = Depends(get_db),
 ):
-  client.used_requests_this_month += 1
-  db.commit()
+    client.used_requests_this_month += 1
+    db.commit()
 
-  raw_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-  if len(raw_list) < 2:
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            "Please provide at least 2 comma-separated tickers (e.g."
-            " ?symbols=AAPL,TSLA,NVDA)"
-        ),
-    )
-  try:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, run_correlation_matrix_sync, raw_list
-    )
-  except Exception as e:
-    raise HTTPException(status_code=500, detail=str(e))
+    raw_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if len(raw_list) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Please provide at least 2 comma-separated tickers (e.g."
+                " ?symbols=AAPL,TSLA,NVDA)"
+            ),
+        )
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, run_correlation_matrix_sync, raw_list
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.websocket("/ws/stream")
 async def websocket_stream_endpoint(websocket: WebSocket):
-  await websocket.accept()
-  loop = asyncio.get_event_loop()
-  try:
-    while True:
-      raw_msg = await websocket.receive_text()
-      payload = json.loads(raw_msg)
-      tickers = payload.get("tickers", [])
+    await websocket.accept()
+    loop = asyncio.get_event_loop()
+    try:
+        while True:
+            raw_msg = await websocket.receive_text()
+            payload = json.loads(raw_msg)
+            tickers = payload.get("tickers", [])
 
-      for ticker in tickers:
-        clean_ticker = ticker.upper()
-        try:
-          metric = await loop.run_in_executor(
-              None, process_single_ticker_sync, clean_ticker
-          )
-          await websocket.send_json(
-              {"status": "success", "data": metric.model_dump()}
-          )
-        except Exception as ex:
-          await websocket.send_json(
-              {"status": "error", "ticker": clean_ticker, "message": str(ex)}
-          )
-        await asyncio.sleep(0.05)
-  except WebSocketDisconnect:
-    pass
-  except Exception:
-    pass
+            for ticker in tickers:
+                clean_ticker = ticker.upper()
+                try:
+                    metric = await loop.run_in_executor(
+                        None, process_single_ticker_sync, clean_ticker
+                    )
+                    await websocket.send_json(
+                        {"status": "success", "data": metric.model_dump()}
+                    )
+                except Exception as ex:
+                    await websocket.send_json(
+                        {"status": "error", "ticker": clean_ticker, "message": str(ex)}
+                    )
+                await asyncio.sleep(0.05)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
-  return """
+    return """
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -1043,20 +973,20 @@ async def serve_dashboard():
     tags=["Enterprise Reporting"],
 )
 async def generate_audit_report(ticker: str):
-  clean_ticker = ticker.strip().upper()
-  try:
-    loop = asyncio.get_event_loop()
-    metric = await loop.run_in_executor(
-        None, process_single_ticker_sync, clean_ticker
-    )
-    var_data = await loop.run_in_executor(
-        None, run_monte_carlo_var_sync, clean_ticker, 1, 5000
-    )
-    backtest_data = await loop.run_in_executor(
-        None, run_quant_backtest_sync, clean_ticker
-    )
+    clean_ticker = ticker.strip().upper()
+    try:
+        loop = asyncio.get_event_loop()
+        metric = await loop.run_in_executor(
+            None, process_single_ticker_sync, clean_ticker
+        )
+        var_data = await loop.run_in_executor(
+            None, run_monte_carlo_var_sync, clean_ticker, 1, 5000
+        )
+        backtest_data = await loop.run_in_executor(
+            None, run_quant_backtest_sync, clean_ticker
+        )
 
-    return f"""
+        return f"""
         <!DOCTYPE html>
         <html>
         <head>
@@ -1148,5 +1078,5 @@ async def generate_audit_report(ticker: str):
         </body>
         </html>
         """
-  except Exception as e:
-    raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
