@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import yfinance as yf
 
@@ -101,7 +101,7 @@ async def rate_limit_middleware(request: Request, call_next):
 
 class ClientRegisterSchema(BaseModel):
   company_name: str
-  email: EmailStr
+  email:str
   tier: str = "starter"
 
 
