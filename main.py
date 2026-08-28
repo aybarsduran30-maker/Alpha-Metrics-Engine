@@ -564,6 +564,20 @@ def get_client_usage(
         "remaining_requests": remaining,
         "status": "active" if client.is_active else "inactive",
     }
+def get_client_usage(
+    client: ApiClient = Depends(verify_api_key),
+    db: Session = Depends(get_db),
+):
+    remaining = max(0, client.monthly_quota - (client.used_requests_this_month or 0))
+    return {
+        "company": client.company_name,
+        "plan_tier": client.plan_tier,
+        "rate_limit_per_min": client.rate_limit_per_min,
+        "monthly_quota": client.monthly_quota,
+        "used_requests": client.used_requests_this_month or 0,
+        "remaining_requests": remaining,
+        "status": "active" if client.is_active else "inactive",
+    }
 
 
 @app.get(
