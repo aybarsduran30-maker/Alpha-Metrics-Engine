@@ -18,21 +18,28 @@ def verify_api_key(
             detail="Missing X-API-Key header"
         )
 
-    if not x_api_key.startswith("am_"):
+    clean_key = x_api_key.strip()
+
+    if not clean_key.startswith("am_"):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API Key format"
         )
 
     client = db.query(ApiClient).filter(
-        ApiClient.api_key == x_api_key,
-        ApiClient.is_active == True
+        ApiClient.api_key == clean_key
     ).first()
 
     if not client:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized API Key"
+        )
+
+    if not client.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Client account is deactivated"
         )
 
     used = client.used_requests_this_month or 0
