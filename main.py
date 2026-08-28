@@ -1,3 +1,6 @@
+from auth_service import verify_api_key
+from models import ApiClient
+
 from fastapi import FastAPI, HTTPException, Security, status, Depends, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from fastapi.security.api_key import APIKeyHeader
