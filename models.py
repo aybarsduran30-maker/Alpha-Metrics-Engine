@@ -1,6 +1,17 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Boolean, DateTime
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String
 from database import Base
+
+class AssetMetricHistory(Base):
+    __tablename__ = "asset_metrics_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(32), index=True)
+    price = Column(Float)
+    change_24h = Column(Float)
+    fourteen_d_rsi = Column(Float)
+    risk_status = Column(String(32))
+    recorded_at = Column(DateTime, default=datetime.utcnow)
 
 class ApiClient(Base):
     __tablename__ = "api_clients"
