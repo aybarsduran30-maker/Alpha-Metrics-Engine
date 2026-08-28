@@ -35,7 +35,10 @@ def verify_api_key(
             detail="Unauthorized API Key"
         )
 
-    if client.used_requests_this_month >= client.monthly_quota:
+    used = client.used_requests_this_month or 0
+    quota = client.monthly_quota or 50000
+
+    if used >= quota:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Monthly quota exceeded"
