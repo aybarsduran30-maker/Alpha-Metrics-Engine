@@ -24,8 +24,10 @@ from sqlalchemy.orm import Session
 import yfinance as yf
 
 from auth_service import generate_api_key, verify_api_key
-from database import get_db
+from database import Base, engine, get_db
 from models import ApiClient
+
+Base.metadata.create_all(bind=engine)
 
 REDIS_ERROR = None
 try:
