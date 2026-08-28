@@ -9,13 +9,19 @@ def generate_api_key(tier: str = "starter") -> str:
     return f"am_{tier}_{token}"
 
 def verify_api_key(
-    x_api_key: str = Header(..., description="Enterprise API Key for AlphaMetrics"),
+    x_api_key: str = Header(None, alias="X-API-Key"),
     db: Session = Depends(get_db)
 ) -> ApiClient:
+    if not x_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-API-Key header"
+        )
+
     if not x_api_key.startswith("am_"):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key format. Key must start with 'am_'."
+            detail="Invalid API Key format"
         )
 
     client = db.query(ApiClient).filter(
@@ -26,13 +32,13 @@ def verify_api_key(
     if not client:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: Invalid or inactive API key."
+            detail="Unauthorized API Key"
         )
 
     if client.used_requests_this_month >= client.monthly_quota:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Monthly quota exceeded. Upgrade your plan at /billing."
+            detail="Monthly quota exceeded"
         )
 
     return client
