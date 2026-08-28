@@ -506,6 +506,47 @@ async def health_check():
 def register_client(
     payload: ClientRegisterSchema, db: Session = Depends(get_db)
 ):
+    try:
+        ApiClient.__table__.create(bind=engine, checkfirst=True)
+        
+        tier_quotas = {
+            "starter": {"rpm": 60, "quota": 50000},
+            "pro": {"rpm": 300, "quota": 500000},
+            "enterprise": {"rpm": 1200, "quota": 5000000},
+        }
+        config = tier_quotas.get(payload.tier.lower(), tier_quotas["starter"])
+
+        key = generate_api_key(payload.tier.lower())
+        client = ApiClient(
+            company_name=payload.company_name,
+            email=payload.email,
+            api_key=key,
+            plan_tier=payload.tier.lower(),
+            rate_limit_per_min=config["rpm"],
+            monthly_quota=config["quota"],
+            used_requests_this_month=0,
+            is_active=True
+        )
+        db.add(client)
+        db.commit()
+        db.refresh(client)
+        return {
+            "status": "success",
+            "company": client.company_name,
+            "email": client.email,
+            "api_key": client.api_key,
+            "tier": client.plan_tier,
+            "monthly_quota": client.monthly_quota,
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Registration failed: {str(e)}"
+        )
+def register_client(
+    payload: ClientRegisterSchema, db: Session = Depends(get_db)
+):
   tier_quotas = {
       "starter": {"rpm": 60, "quota": 50000},
       "pro": {"rpm": 300, "quota": 500000},
