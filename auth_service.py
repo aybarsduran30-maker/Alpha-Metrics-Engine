@@ -10,7 +10,7 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 def generate_api_key(tier: str = "starter") -> str:
     random_hex = secrets.token_hex(16)
-    return f"{tier}_{random_hex}"
+    return f"am_{tier}_{random_hex}"
 
 def verify_api_key(
     key: str = Security(api_key_header),
