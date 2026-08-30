@@ -3,7 +3,7 @@ import datetime
 import json
 import os
 import time
-from typing import List
+from typing import List, Optional
 
 from fastapi import (
     BackgroundTasks,
@@ -73,7 +73,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    if request.url.path in ["/health", "/docs", "/openapi.json", "/"]:
+    if request.url.path in ["/health", "/docs", "/openapi.json", "/", "/api/v1/billing/webhook"]:
         return await call_next(request)
 
     if REDIS_AVAILABLE and r_client:
@@ -137,6 +137,12 @@ class PortfolioRiskAnalysis(BaseModel):
     average_correlation: float
     diversification_score: str
     generated_at: str
+
+
+class WebhookPayload(BaseModel):
+    event_type: str
+    api_key: str
+    new_tier: str
 
 
 def log_metric_to_db(
@@ -564,19 +570,33 @@ def get_client_usage(
         "remaining_requests": remaining,
         "status": "active" if client.is_active else "inactive",
     }
-def get_client_usage(
-    client: ApiClient = Depends(verify_api_key),
-    db: Session = Depends(get_db),
-):
-    remaining = max(0, client.monthly_quota - (client.used_requests_this_month or 0))
+
+
+@app.post("/api/v1/billing/webhook", tags=["B2B Billing"])
+def stripe_mock_webhook(payload: WebhookPayload, db: Session = Depends(get_db)):
+    tier_quotas = {
+        "starter": {"rpm": 60, "quota": 50000},
+        "pro": {"rpm": 300, "quota": 500000},
+        "enterprise": {"rpm": 1200, "quota": 5000000},
+    }
+    target_tier = payload.new_tier.lower()
+    if target_tier not in tier_quotas:
+        raise HTTPException(status_code=400, detail="Invalid tier name")
+
+    client = db.query(ApiClient).filter(ApiClient.api_key == payload.api_key).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="API client not found")
+
+    client.plan_tier = target_tier
+    client.rate_limit_per_min = tier_quotas[target_tier]["rpm"]
+    client.monthly_quota = tier_quotas[target_tier]["quota"]
+    db.commit()
+
     return {
+        "status": "success",
         "company": client.company_name,
-        "plan_tier": client.plan_tier,
-        "rate_limit_per_min": client.rate_limit_per_min,
-        "monthly_quota": client.monthly_quota,
-        "used_requests": client.used_requests_this_month or 0,
-        "remaining_requests": remaining,
-        "status": "active" if client.is_active else "inactive",
+        "new_tier": client.plan_tier,
+        "new_monthly_quota": client.monthly_quota,
     }
 
 
@@ -750,6 +770,28 @@ async def serve_dashboard():
                 </div>
             </div>
 
+            <section class="bg-gray-900/60 border border-gray-800 rounded-xl p-5 mb-6 shadow-xl">
+                <div class="flex items-center justify-between mb-3">
+                    <span class="text-xs font-bold uppercase tracking-wider text-emerald-400">B2B API Key Inspector & Quota Manager</span>
+                    <span class="text-[11px] text-gray-500">Live Auth Subsystem</span>
+                </div>
+                <div class="flex gap-2">
+                    <input id="keyInspectorInput" type="text" placeholder="Enter X-API-Key (e.g. starter_..., enterprise_...)" 
+                           class="flex-1 bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 font-mono text-gray-200">
+                    <button onclick="inspectApiKey()" class="bg-emerald-600 hover:bg-emerald-500 text-black font-bold px-4 py-2 rounded-lg text-xs transition">
+                        Verify Key
+                    </button>
+                </div>
+                <div id="inspectorResult" class="hidden mt-3 bg-gray-950/80 border border-gray-800 rounded-lg p-3 text-xs font-mono">
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div><span class="text-gray-500">Company:</span> <b id="statCompany" class="text-white block">-</b></div>
+                        <div><span class="text-gray-500">Tier:</span> <b id="statTier" class="text-emerald-400 block">-</b></div>
+                        <div><span class="text-gray-500">RPM Limit:</span> <b id="statRpm" class="text-gray-300 block">-</b></div>
+                        <div><span class="text-gray-500">Quota Remaining:</span> <b id="statQuota" class="text-emerald-400 block">-</b></div>
+                    </div>
+                </div>
+            </section>
+
             <div class="flex gap-2 mb-6">
                 <input id="newTicker" type="text" placeholder="Add Symbol (e.g. INTC, AMZN, PLTR)" 
                        class="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 uppercase tracking-wider">
@@ -825,6 +867,27 @@ async def serve_dashboard():
             ];
 
             let ws = null;
+
+            async function inspectApiKey() {
+                const key = document.getElementById('keyInspectorInput').value.trim();
+                const resBox = document.getElementById('inspectorResult');
+                if (!key) { alert('Please enter an API Key'); return; }
+
+                try {
+                    const res = await fetch('/api/v1/auth/usage', {
+                        headers: { 'X-API-Key': key }
+                    });
+                    if (!res.ok) throw new Error(await res.text());
+                    const data = await res.json();
+                    resBox.classList.remove('hidden');
+                    document.getElementById('statCompany').innerText = data.company;
+                    document.getElementById('statTier').innerText = data.plan_tier.toUpperCase();
+                    document.getElementById('statRpm').innerText = data.rate_limit_per_min + ' RPM';
+                    document.getElementById('statQuota').innerText = data.remaining_requests + ' / ' + data.monthly_quota;
+                } catch (err) {
+                    alert('Authentication failed: ' + err.message);
+                }
+            }
 
             function initLayout() {
                 const tbody = document.getElementById('watchlistBody');
