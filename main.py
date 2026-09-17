@@ -149,7 +149,8 @@ def log_metric_to_db(
     ticker: str, price: float, change_24h: float, rsi: float, status_desc: str
 ):
     try:
-        from database import AssetMetricHistory, SessionLocal
+        from models import AssetMetricHistory
+        from database import SessionLocal
 
         db = SessionLocal()
         record = AssetMetricHistory(
@@ -736,6 +737,8 @@ async def websocket_stream_endpoint(websocket: WebSocket):
         pass
     except Exception:
         pass
+
+
 @app.websocket("/ws/hft-risk")
 async def websocket_hft_risk_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -758,6 +761,7 @@ async def websocket_hft_risk_endpoint(websocket: WebSocket):
     except Exception:
         pubsub.unsubscribe("lob_risk_feed")
         pubsub.close()
+
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
@@ -791,7 +795,6 @@ async def serve_dashboard():
                 </div>
             </div>
 
-            <!-- HFT Real-time Risk Subsystem Banner -->
             <section class="bg-gray-900/80 border border-emerald-500/30 rounded-xl p-5 mb-6 shadow-2xl relative overflow-hidden">
                 <div class="flex items-center justify-between mb-3 border-b border-gray-800/80 pb-2">
                     <div class="flex items-center gap-2">

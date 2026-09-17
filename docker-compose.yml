@@ -1,18 +1,42 @@
 version: '3.8'
 
 services:
-  api:
-    build: .
+  redis:
+    image: redis:7-alpine
+    container_name: nova_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+    restart: always
+
+  alphametrics-api:
+    build:
+      context: ./Alpha-Metrics-Engine
+      dockerfile: Dockerfile
+    container_name: alphametrics_core
     ports:
       - "8000:8000"
     environment:
-      - REDIS_URL=redis://cache:6379/0
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=sqlite:///./alphametrics.db
     depends_on:
-      - cache
+      redis:
+        condition: service_healthy
     restart: always
 
-  cache:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
+  alphametrics-consumer:
+    build:
+      context: ./Alpha-Metrics-Engine
+      dockerfile: Dockerfile
+    container_name: alphametrics_stream_worker
+    command: ["python", "stream_consumer.py"]
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: always
