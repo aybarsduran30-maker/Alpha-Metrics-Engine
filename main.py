@@ -736,9 +736,7 @@ async def websocket_stream_endpoint(websocket: WebSocket):
         pass
     except Exception:
         pass
-        except Exception:
-        pubsub.unsubscribe("lob_risk_feed")
-        pubsub.close()
+      
 
 @app.websocket("/ws/latency")
 async def websocket_latency(websocket: WebSocket):
