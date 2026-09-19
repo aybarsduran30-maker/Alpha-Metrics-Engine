@@ -53,3 +53,10 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
 uvicorn main:app --reload --port 8000
+
+
+
+## Real-Time Risk Subsystem
+* **Worker:** Asynchronous tick-by-tick risk processor via Redis consumer groups.
+* **Metrics:** Live Value at Risk (VaR 95%), Expected Shortfall (CVaR), and Level-2 LOB Spread.
+* **Telemetry:** Broadcasts via Redis Pub/Sub to FastAPI WebSockets (`/ws/hft-risk`).

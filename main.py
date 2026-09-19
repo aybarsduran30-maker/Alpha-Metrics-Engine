@@ -149,8 +149,7 @@ def log_metric_to_db(
     ticker: str, price: float, change_24h: float, rsi: float, status_desc: str
 ):
     try:
-        from models import AssetMetricHistory
-        from database import SessionLocal
+        from database import AssetMetricHistory, SessionLocal
 
         db = SessionLocal()
         record = AssetMetricHistory(
@@ -737,7 +736,32 @@ async def websocket_stream_endpoint(websocket: WebSocket):
         pass
     except Exception:
         pass
+        except Exception:
+        pubsub.unsubscribe("lob_risk_feed")
+        pubsub.close()
 
+@app.websocket("/ws/latency")
+async def websocket_latency(websocket: WebSocket):
+    await websocket.accept()
+    if not REDIS_AVAILABLE or not r_client:
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
+
+    pubsub = r_client.pubsub()
+    pubsub.subscribe("nova_latency_feed")
+
+    try:
+        while True:
+            message = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
+            if message and message.get("type") == "message":
+                await websocket.send_text(message["data"])
+            await asyncio.sleep(0.01)
+    except WebSocketDisconnect:
+        pubsub.unsubscribe("nova_latency_feed")
+        pubsub.close()
+    except Exception:
+        pubsub.unsubscribe("nova_latency_feed")
+        pubsub.close()
 
 @app.websocket("/ws/hft-risk")
 async def websocket_hft_risk_endpoint(websocket: WebSocket):
@@ -761,7 +785,6 @@ async def websocket_hft_risk_endpoint(websocket: WebSocket):
     except Exception:
         pubsub.unsubscribe("lob_risk_feed")
         pubsub.close()
-
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
@@ -795,6 +818,7 @@ async def serve_dashboard():
                 </div>
             </div>
 
+            <!-- HFT Real-time Risk Subsystem Banner -->
             <section class="bg-gray-900/80 border border-emerald-500/30 rounded-xl p-5 mb-6 shadow-2xl relative overflow-hidden">
                 <div class="flex items-center justify-between mb-3 border-b border-gray-800/80 pb-2">
                     <div class="flex items-center gap-2">
