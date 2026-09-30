@@ -1,5 +1,7 @@
  AlphaMetrics Financial Intelligence & Execution Engine (v4.0)
 
+ [![Docker Image](https://img.shields.io/badge/Docker-Hub%20Image-blue.svg?style=flat&logo=docker&logoColor=white)](https://hub.docker.com/r/aybarsdrn/alphametrics)
+
 [![AlphaMetrics CI Engine](https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine/actions/workflows/ci.yml)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110.0-009688.svg?style=flat&logo=FastAPI&logoColor=white)](https://fastapi.tiangolo.com)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg?style=flat&logo=python&logoColor=white)](https://www.python.org/)
