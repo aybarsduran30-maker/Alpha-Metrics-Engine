@@ -1,7 +1,9 @@
 import asyncio
+from contextlib import asynccontextmanager
 import datetime
 import json
 import os
+import random
 import time
 from typing import List, Optional
 
@@ -54,12 +56,82 @@ except Exception as e:
     r_client = None
     REDIS_AVAILABLE = False
 
+
+def calculate_hft_risk_math(prices: list, horizon_ticks: int = 10, simulations: int = 2000):
+    if len(prices) < 15:
+        return None
+    price_series = np.array(prices, dtype=np.float64)
+    returns = np.diff(price_series) / price_series[:-1]
+    mean_ret = float(np.mean(returns))
+    std_ret = float(np.std(returns))
+    current_price = float(price_series[-1])
+    if std_ret == 0:
+        return None
+    sim_returns = np.random.normal(
+        (mean_ret - 0.5 * std_ret**2) * horizon_ticks,
+        std_ret * np.sqrt(horizon_ticks),
+        simulations,
+    )
+    sim_price_changes = current_price * sim_returns
+    var_95 = float(np.percentile(sim_price_changes, 5))
+    var_99 = float(np.percentile(sim_price_changes, 1))
+    cvar_95 = float(sim_price_changes[sim_price_changes <= var_95].mean())
+    return {
+        "current_price": round(current_price, 2),
+        "tick_window": len(prices),
+        "tick_volatility": round(std_ret, 6),
+        "var_95": round(abs(var_95), 4),
+        "var_99": round(abs(var_99), 4),
+        "cvar_95": round(abs(cvar_95), 4),
+        "updated_at": time.time(),
+    }
+
+
+async def background_lob_engine():
+    current_price = 150.0
+    prices = [current_price + (random.random() - 0.5) for _ in range(20)]
+    while True:
+        try:
+            delta = (random.random() - 0.49) * 0.4
+            current_price = round(max(10.0, current_price + delta), 2)
+            prices.append(current_price)
+            if len(prices) > 300:
+                prices = prices[-300:]
+
+            spread = random.choice([1, 2, 3])
+            ofi = round((random.random() - 0.5) * 2.0, 4)
+
+            metrics = calculate_hft_risk_math(prices)
+            if metrics:
+                metrics.update({
+                    "spread": spread,
+                    "ofi": ofi,
+                    "best_bid": current_price,
+                    "best_ask": round(current_price + (spread * 0.01), 2),
+                })
+                payload_str = json.dumps(metrics)
+                if REDIS_AVAILABLE and r_client:
+                    r_client.set("live_hft_risk", payload_str)
+                    r_client.publish("lob_risk_feed", payload_str)
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(background_lob_engine())
+    yield
+    task.cancel()
+
+
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
     version="4.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -736,37 +808,17 @@ async def websocket_stream_endpoint(websocket: WebSocket):
         pass
     except Exception:
         pass
-      
 
-@app.websocket("/ws/latency")
-async def websocket_latency(websocket: WebSocket):
-    await websocket.accept()
-    if not REDIS_AVAILABLE or not r_client:
-        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-        return
-
-    pubsub = r_client.pubsub()
-    pubsub.subscribe("nova_latency_feed")
-
-    try:
-        while True:
-            message = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
-            if message and message.get("type") == "message":
-                await websocket.send_text(message["data"])
-            await asyncio.sleep(0.01)
-    except WebSocketDisconnect:
-        pubsub.unsubscribe("nova_latency_feed")
-        pubsub.close()
-    except Exception:
-        pubsub.unsubscribe("nova_latency_feed")
-        pubsub.close()
 
 @app.websocket("/ws/hft-risk")
 async def websocket_hft_risk_endpoint(websocket: WebSocket):
     await websocket.accept()
     if not REDIS_AVAILABLE or not r_client:
-        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-        return
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+        except WebSocketDisconnect:
+            return
 
     pubsub = r_client.pubsub()
     pubsub.subscribe("lob_risk_feed")
@@ -783,6 +835,7 @@ async def websocket_hft_risk_endpoint(websocket: WebSocket):
     except Exception:
         pubsub.unsubscribe("lob_risk_feed")
         pubsub.close()
+
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
