@@ -46,7 +46,12 @@ Quantitative & Market Risk Endpoints (Header: `X-API-Key`)
 
 ## Local Development & Testing
 Running Locally
+
+
 ```bash
+docker pull aybarsdrn/alphametrics:latest
+docker run -p 8000:8000 aybarsdrn/alphametrics:latest
+
 git clone [https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine.git](https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine.git)
 cd Alpha-Metrics-Engine
 
