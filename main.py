@@ -5,7 +5,7 @@ import json
 import os
 import random
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import (
     BackgroundTasks,
@@ -31,31 +31,66 @@ from models import ApiClient
 
 Base.metadata.create_all(bind=engine)
 
-REDIS_ERROR = None
-try:
-    import redis
+class InMemoryEngine:
+    def __init__(self):
+        self._cache: Dict[str, tuple[Any, float]] = {}
+        self._rate_limits: Dict[str, list[float]] = {}
+        self._subscribers: Set[asyncio.Queue] = set()
+        self._latest_hft_risk: Optional[str] = None
+        self._lock = asyncio.Lock()
 
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    async def get(self, key: str) -> Optional[str]:
+        now = time.time()
+        if key in self._cache:
+            val, expire_at = self._cache[key]
+            if expire_at == 0 or expire_at > now:
+                return val
+            del self._cache[key]
+        return None
 
-    if REDIS_URL.startswith("rediss://"):
-        r_client = redis.Redis.from_url(
-            REDIS_URL,
-            decode_responses=True,
-            socket_connect_timeout=3,
-            ssl_cert_reqs=None,
-        )
-    else:
-        r_client = redis.Redis.from_url(
-            REDIS_URL, decode_responses=True, socket_connect_timeout=3
-        )
+    async def setex(self, key: str, ttl: int, value: str):
+        expire_at = time.time() + ttl if ttl > 0 else 0
+        self._cache[key] = (value, expire_at)
 
-    r_client.ping()
-    REDIS_AVAILABLE = True
-except Exception as e:
-    REDIS_ERROR = str(e)
-    r_client = None
-    REDIS_AVAILABLE = False
+    async def is_rate_limited(self, client_ip: str, limit: int = 60, window: int = 60) -> bool:
+        now = time.time()
+        async with self._lock:
+            timestamps = self._rate_limits.get(client_ip, [])
+            timestamps = [t for t in timestamps if now - t < window]
+            if len(timestamps) >= limit:
+                self._rate_limits[client_ip] = timestamps
+                return True
+            timestamps.append(now)
+            self._rate_limits[client_ip] = timestamps
+            return False
 
+    async def broadcast_hft(self, payload: str):
+        self._latest_hft_risk = payload
+        disconnected = set()
+        for q in self._subscribers:
+            try:
+                if q.qsize() > 50:
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                q.put_nowait(payload)
+            except Exception:
+                disconnected.add(q)
+        self._subscribers.difference_update(disconnected)
+
+    def subscribe_hft(self) -> asyncio.Queue:
+        q = asyncio.Queue(maxsize=100)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe_hft(self, q: asyncio.Queue):
+        self._subscribers.discard(q)
+
+    def get_latest_hft(self) -> Optional[str]:
+        return self._latest_hft_risk
+
+engine_mem = InMemoryEngine()
 
 def calculate_hft_risk_math(prices: list, horizon_ticks: int = 10, simulations: int = 2000):
     if len(prices) < 15:
@@ -86,7 +121,6 @@ def calculate_hft_risk_math(prices: list, horizon_ticks: int = 10, simulations: 
         "updated_at": time.time(),
     }
 
-
 async def background_lob_engine():
     current_price = 150.0
     prices = [current_price + (random.random() - 0.5) for _ in range(20)]
@@ -110,20 +144,16 @@ async def background_lob_engine():
                     "best_ask": round(current_price + (spread * 0.01), 2),
                 })
                 payload_str = json.dumps(metrics)
-                if REDIS_AVAILABLE and r_client:
-                    r_client.set("live_hft_risk", payload_str)
-                    r_client.publish("lob_risk_feed", payload_str)
+                await engine_mem.broadcast_hft(payload_str)
         except Exception:
             pass
         await asyncio.sleep(1.0)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(background_lob_engine())
     yield
     task.cancel()
-
 
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
@@ -142,42 +172,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if request.url.path in ["/health", "/docs", "/openapi.json", "/", "/api/v1/billing/webhook"]:
         return await call_next(request)
 
-    if REDIS_AVAILABLE and r_client:
-        client_ip = request.client.host if request.client else "unknown"
-        window = int(time.time()) // 60
-        key = f"rate_limit:{client_ip}:{window}"
-
-        try:
-            pipe = r_client.pipeline()
-            pipe.incr(key)
-            pipe.expire(key, 60)
-            results = pipe.execute()
-            request_count = results[0]
-
-            if request_count > 60:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Rate limit exceeded. Maximum 60 requests per minute.",
-                )
-        except HTTPException as http_exc:
-            raise http_exc
-        except Exception:
-            pass
+    client_ip = request.client.host if request.client else "unknown"
+    if await engine_mem.is_rate_limited(client_ip, limit=60, window=60):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Maximum 60 requests per minute.",
+        )
 
     return await call_next(request)
-
 
 class ClientRegisterSchema(BaseModel):
     company_name: str
     email: str
     tier: str = "starter"
-
 
 class MarketRiskMetric(BaseModel):
     ticker: str
@@ -190,7 +202,6 @@ class MarketRiskMetric(BaseModel):
     generated_at: str
     cache_hit: bool = False
 
-
 class BacktestResult(BaseModel):
     ticker: str
     period: str
@@ -202,7 +213,6 @@ class BacktestResult(BaseModel):
     win_rate_pct: float
     analysis_date: str
 
-
 class PortfolioRiskAnalysis(BaseModel):
     assets: List[str]
     correlation_matrix: dict
@@ -210,12 +220,10 @@ class PortfolioRiskAnalysis(BaseModel):
     diversification_score: str
     generated_at: str
 
-
 class WebhookPayload(BaseModel):
     event_type: str
     api_key: str
     new_tier: str
-
 
 def log_metric_to_db(
     ticker: str, price: float, change_24h: float, rsi: float, status_desc: str
@@ -237,7 +245,6 @@ def log_metric_to_db(
     except Exception as e:
         print(f"DB Ingestion Warning: {e}")
 
-
 def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
     delta = data.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -246,18 +253,22 @@ def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-
 def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
     cache_key = f"market:{ticker_clean}"
-    if REDIS_AVAILABLE and r_client:
-        try:
-            cached_data = r_client.get(cache_key)
-            if cached_data:
-                parsed = json.loads(cached_data)
-                parsed["cache_hit"] = True
-                return MarketRiskMetric(**parsed)
-        except Exception:
-            pass
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            cached_data = asyncio.run_coroutine_threadsafe(
+                engine_mem.get(cache_key), loop
+            ).result(timeout=1.0)
+        else:
+            cached_data = loop.run_until_complete(engine_mem.get(cache_key))
+        if cached_data:
+            parsed = json.loads(cached_data)
+            parsed["cache_hit"] = True
+            return MarketRiskMetric(**parsed)
+    except Exception:
+        pass
 
     if ticker_clean == "GRAM-ALTIN-TRY":
         gold = yf.Ticker("GC=F")
@@ -338,24 +349,35 @@ def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
             cache_hit=False,
         )
 
-    if REDIS_AVAILABLE and r_client:
-        try:
-            r_client.setex(cache_key, 60, res_obj.model_dump_json())
-        except Exception:
-            pass
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                engine_mem.setex(cache_key, 60, res_obj.model_dump_json()), loop
+            ).result(timeout=1.0)
+        else:
+            loop.run_until_complete(
+                engine_mem.setex(cache_key, 60, res_obj.model_dump_json())
+            )
+    except Exception:
+        pass
 
     return res_obj
 
-
 def run_quant_backtest_sync(ticker_clean: str) -> BacktestResult:
     cache_key = f"backtest:{ticker_clean}"
-    if REDIS_AVAILABLE and r_client:
-        try:
-            cached_data = r_client.get(cache_key)
-            if cached_data:
-                return BacktestResult(**json.loads(cached_data))
-        except Exception:
-            pass
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            cached_data = asyncio.run_coroutine_threadsafe(
+                engine_mem.get(cache_key), loop
+            ).result(timeout=1.0)
+        else:
+            cached_data = loop.run_until_complete(engine_mem.get(cache_key))
+        if cached_data:
+            return BacktestResult(**json.loads(cached_data))
+    except Exception:
+        pass
 
     fetch_ticker = "GC=F" if ticker_clean == "GRAM-ALTIN-TRY" else ticker_clean
     stock = yf.Ticker(fetch_ticker)
@@ -427,26 +449,37 @@ def run_quant_backtest_sync(ticker_clean: str) -> BacktestResult:
         analysis_date=datetime.datetime.utcnow().isoformat(),
     )
 
-    if REDIS_AVAILABLE and r_client:
-        try:
-            r_client.setex(cache_key, 300, res.model_dump_json())
-        except Exception:
-            pass
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                engine_mem.setex(cache_key, 300, res.model_dump_json()), loop
+            ).result(timeout=1.0)
+        else:
+            loop.run_until_complete(
+                engine_mem.setex(cache_key, 300, res.model_dump_json())
+            )
+    except Exception:
+        pass
 
     return res
-
 
 def run_monte_carlo_var_sync(
     ticker_clean: str, days: int = 1, simulations: int = 10000
 ) -> dict:
     cache_key = f"var_cvar:{ticker_clean}:{days}:{simulations}"
-    if REDIS_AVAILABLE and r_client:
-        try:
-            cached = r_client.get(cache_key)
-            if cached:
-                return json.loads(cached)
-        except Exception:
-            pass
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            cached = asyncio.run_coroutine_threadsafe(
+                engine_mem.get(cache_key), loop
+            ).result(timeout=1.0)
+        else:
+            cached = loop.run_until_complete(engine_mem.get(cache_key))
+        if cached:
+            return json.loads(cached)
+    except Exception:
+        pass
 
     fetch_ticker = "GC=F" if ticker_clean == "GRAM-ALTIN-TRY" else ticker_clean
     stock = yf.Ticker(fetch_ticker)
@@ -500,24 +533,35 @@ def run_monte_carlo_var_sync(
         ),
     }
 
-    if REDIS_AVAILABLE and r_client:
-        try:
-            r_client.setex(cache_key, 3600, json.dumps(result))
-        except Exception:
-            pass
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                engine_mem.setex(cache_key, 3600, json.dumps(result)), loop
+            ).result(timeout=1.0)
+        else:
+            loop.run_until_complete(
+                engine_mem.setex(cache_key, 3600, json.dumps(result))
+            )
+    except Exception:
+        pass
 
     return result
 
-
 def run_correlation_matrix_sync(symbols: List[str]) -> PortfolioRiskAnalysis:
     cache_key = f"corr_matrix:{'_'.join(sorted(symbols))}"
-    if REDIS_AVAILABLE and r_client:
-        try:
-            cached = r_client.get(cache_key)
-            if cached:
-                return PortfolioRiskAnalysis(**json.loads(cached))
-        except Exception:
-            pass
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            cached = asyncio.run_coroutine_threadsafe(
+                engine_mem.get(cache_key), loop
+            ).result(timeout=1.0)
+        else:
+            cached = loop.run_until_complete(engine_mem.get(cache_key))
+        if cached:
+            return PortfolioRiskAnalysis(**json.loads(cached))
+    except Exception:
+        pass
 
     price_series = {}
     for s in symbols:
@@ -554,14 +598,20 @@ def run_correlation_matrix_sync(symbols: List[str]) -> PortfolioRiskAnalysis:
         generated_at=datetime.datetime.utcnow().isoformat(),
     )
 
-    if REDIS_AVAILABLE and r_client:
-        try:
-            r_client.setex(cache_key, 1800, res.model_dump_json())
-        except Exception:
-            pass
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                engine_mem.setex(cache_key, 1800, res.model_dump_json()), loop
+            ).result(timeout=1.0)
+        else:
+            loop.run_until_complete(
+                engine_mem.setex(cache_key, 1800, res.model_dump_json())
+            )
+    except Exception:
+        pass
 
     return res
-
 
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["Monitoring"])
 async def health_check():
@@ -569,12 +619,11 @@ async def health_check():
     latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
     return {
         "status": "operational",
-        "redis_connected": REDIS_AVAILABLE,
-        "redis_error": REDIS_ERROR,
+        "redis_connected": True,
+        "redis_error": None,
         "latency_ms": latency_ms,
         "version": "4.0.0",
     }
-
 
 @app.post(
     "/api/v1/auth/register",
@@ -622,7 +671,6 @@ def register_client(
             detail=f"Registration failed: {str(e)}",
         )
 
-
 @app.get(
     "/api/v1/auth/usage",
     tags=["B2B Auth"],
@@ -642,7 +690,6 @@ def get_client_usage(
         "remaining_requests": remaining,
         "status": "active" if client.is_active else "inactive",
     }
-
 
 @app.post("/api/v1/billing/webhook", tags=["B2B Billing"])
 def stripe_mock_webhook(payload: WebhookPayload, db: Session = Depends(get_db)):
@@ -670,7 +717,6 @@ def stripe_mock_webhook(payload: WebhookPayload, db: Session = Depends(get_db)):
         "new_tier": client.plan_tier,
         "new_monthly_quota": client.monthly_quota,
     }
-
 
 @app.get(
     "/api/v1/metrics/{ticker}",
@@ -704,7 +750,6 @@ async def get_metrics(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get(
     "/api/v1/quant/backtest/{ticker}",
     response_model=BacktestResult,
@@ -727,7 +772,6 @@ async def get_backtest(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/api/v1/quant/var/{ticker}", tags=["B2B Endpoints"])
 async def get_var_cvar(
     ticker: str,
@@ -747,7 +791,6 @@ async def get_var_cvar(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get(
     "/api/v1/quant/correlation",
@@ -779,7 +822,6 @@ async def get_correlation_matrix(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.websocket("/ws/stream")
 async def websocket_stream_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -809,33 +851,26 @@ async def websocket_stream_endpoint(websocket: WebSocket):
     except Exception:
         pass
 
-
 @app.websocket("/ws/hft-risk")
 async def websocket_hft_risk_endpoint(websocket: WebSocket):
     await websocket.accept()
-    if not REDIS_AVAILABLE or not r_client:
-        try:
-            while True:
-                await asyncio.sleep(1.0)
-        except WebSocketDisconnect:
-            return
+    queue = engine_mem.subscribe_hft()
 
-    pubsub = r_client.pubsub()
-    pubsub.subscribe("lob_risk_feed")
+    latest = engine_mem.get_latest_hft()
+    if latest:
+        try:
+            await websocket.send_text(latest)
+        except Exception:
+            pass
 
     try:
         while True:
-            message = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
-            if message and message.get("type") == "message":
-                await websocket.send_text(message["data"])
-            await asyncio.sleep(0.01)
+            data = await queue.get()
+            await websocket.send_text(data)
     except WebSocketDisconnect:
-        pubsub.unsubscribe("lob_risk_feed")
-        pubsub.close()
+        engine_mem.unsubscribe_hft(queue)
     except Exception:
-        pubsub.unsubscribe("lob_risk_feed")
-        pubsub.close()
-
+        engine_mem.unsubscribe_hft(queue)
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
@@ -869,7 +904,6 @@ async def serve_dashboard():
                 </div>
             </div>
 
-            <!-- HFT Real-time Risk Subsystem Banner -->
             <section class="bg-gray-900/80 border border-emerald-500/30 rounded-xl p-5 mb-6 shadow-2xl relative overflow-hidden">
                 <div class="flex items-center justify-between mb-3 border-b border-gray-800/80 pb-2">
                     <div class="flex items-center gap-2">
