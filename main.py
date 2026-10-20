@@ -3,9 +3,11 @@ from contextlib import asynccontextmanager
 import datetime
 import json
 import os
-import random
+import threading
 import time
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from fastapi import (
     BackgroundTasks,
@@ -21,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import numpy as np
 import pandas as pd
+import httpx
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import yfinance as yf
@@ -91,6 +94,8 @@ class InMemoryEngine:
         return self._latest_hft_risk
 
 engine_mem = InMemoryEngine()
+market_metric_cache: Dict[str, tuple[float, "MarketRiskMetric"]] = {}
+market_metric_cache_lock = threading.Lock()
 
 def calculate_hft_risk_math(prices: list, horizon_ticks: int = 10, simulations: int = 2000):
     if len(prices) < 15:
@@ -122,32 +127,47 @@ def calculate_hft_risk_math(prices: list, horizon_ticks: int = 10, simulations: 
     }
 
 async def background_lob_engine():
-    current_price = 150.0
-    prices = [current_price + (random.random() - 0.5) for _ in range(20)]
-    while True:
-        try:
-            delta = (random.random() - 0.49) * 0.4
-            current_price = round(max(10.0, current_price + delta), 2)
-            prices.append(current_price)
-            if len(prices) > 300:
-                prices = prices[-300:]
+    prices = []
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        while True:
+            try:
+                response = await client.get(
+                    "https://data-api.binance.vision/api/v3/ticker/bookTicker",
+                    params={"symbol": "BTCUSDT"},
+                )
+                response.raise_for_status()
+                quote = response.json()
+                best_bid = float(quote["bidPrice"])
+                best_ask = float(quote["askPrice"])
+                bid_size = float(quote["bidQty"])
+                ask_size = float(quote["askQty"])
+                current_price = (best_bid + best_ask) / 2
+                prices.append(current_price)
+                if len(prices) > 300:
+                    prices = prices[-300:]
 
-            spread = random.choice([1, 2, 3])
-            ofi = round((random.random() - 0.5) * 2.0, 4)
-
-            metrics = calculate_hft_risk_math(prices)
-            if metrics:
+                metrics = calculate_hft_risk_math(prices) or {}
                 metrics.update({
-                    "spread": spread,
-                    "ofi": ofi,
-                    "best_bid": current_price,
-                    "best_ask": round(current_price + (spread * 0.01), 2),
+                    "status": "live",
+                    "symbol": "BTC/USDT",
+                    "exchange": "Binance Spot",
+                    "current_price": current_price,
+                    "spread": best_ask - best_bid,
+                    "ofi": (bid_size - ask_size) / (bid_size + ask_size)
+                    if bid_size + ask_size else 0.0,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "data_as_of": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 })
-                payload_str = json.dumps(metrics)
-                await engine_mem.broadcast_hft(payload_str)
-        except Exception:
-            pass
-        await asyncio.sleep(1.0)
+                await engine_mem.broadcast_hft(json.dumps(metrics))
+            except Exception:
+                await engine_mem.broadcast_hft(json.dumps({
+                    "status": "unavailable",
+                    "symbol": "BTC/USDT",
+                    "exchange": "Binance Spot",
+                    "data_as_of": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                }))
+            await asyncio.sleep(1.0)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -200,6 +220,8 @@ class MarketRiskMetric(BaseModel):
     rsi_14: float
     momentum_status: str
     generated_at: str
+    quote_source: str = "Yahoo Finance"
+    data_as_of: Optional[str] = None
     cache_hit: bool = False
 
 class BacktestResult(BaseModel):
@@ -253,114 +275,143 @@ def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
+BINANCE_SPOT_SYMBOLS = {
+    "BTC-USD": "BTCUSDT",
+    "ETH-USD": "ETHUSDT",
+    "SOL-USD": "SOLUSDT",
+}
+
+
+def fetch_public_json(base_url: str, params: dict) -> Any:
+    request = Request(
+        f"{base_url}?{urlencode(params)}",
+        headers={"User-Agent": "AlphaMetrics/4.1"},
+    )
+    with urlopen(request, timeout=8) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def get_market_history(ticker: str):
+    instrument = yf.Ticker(ticker)
+    daily = instrument.history(period="3mo", interval="1d")
+    intraday = instrument.history(period="1d", interval="1m")
+    if daily.empty:
+        raise ValueError(f"No daily market history available for {ticker}")
+    if intraday.empty:
+        intraday = daily.tail(1)
+    return daily, intraday
+
+
+def build_metric(ticker, price, change_pct, currency, daily_closes, data_as_of, source):
+    daily_closes = pd.Series(daily_closes, dtype="float64").dropna()
+    rsi_series = calculate_rsi(daily_closes, period=14)
+    rsi_value = rsi_series.iloc[-1] if not rsi_series.empty else 50.0
+    rsi_value = 50.0 if pd.isna(rsi_value) else float(rsi_value)
+    status_desc = "Overbought" if rsi_value >= 70 else "Oversold" if rsi_value <= 30 else "Neutral"
+
+    return MarketRiskMetric(
+        ticker=ticker,
+        price=round(float(price), 8 if currency == "USDT" else 2),
+        change_percent=round(float(change_pct), 2),
+        currency=currency,
+        fifty_day_average=round(float(daily_closes.tail(50).mean()), 2),
+        rsi_14=round(rsi_value, 2),
+        momentum_status=status_desc,
+        generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        quote_source=source,
+        data_as_of=pd.Timestamp(data_as_of).isoformat(),
+        cache_hit=False,
+    )
+
+
+def process_binance_ticker(ticker_clean: str) -> MarketRiskMetric:
+    symbol = BINANCE_SPOT_SYMBOLS[ticker_clean]
+    base = "https://data-api.binance.vision/api/v3"
+    quote = fetch_public_json(f"{base}/ticker/24hr", {"symbol": symbol})
+    klines = fetch_public_json(
+        f"{base}/klines", {"symbol": symbol, "interval": "1d", "limit": 90}
+    )
+    closes = pd.Series([float(candle[4]) for candle in klines], dtype="float64")
+    as_of = datetime.datetime.fromtimestamp(
+        int(quote["closeTime"]) / 1000, tz=datetime.timezone.utc
+    )
+    return build_metric(
+        ticker=ticker_clean,
+        price=float(quote["lastPrice"]),
+        change_pct=float(quote["priceChangePercent"]),
+        currency="USDT",
+        daily_closes=closes,
+        data_as_of=as_of,
+        source=f"Binance Spot {symbol}",
+    )
+
+
 def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
-    cache_key = f"market:{ticker_clean}"
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            cached_data = asyncio.run_coroutine_threadsafe(
-                engine_mem.get(cache_key), loop
-            ).result(timeout=1.0)
-        else:
-            cached_data = loop.run_until_complete(engine_mem.get(cache_key))
-        if cached_data:
-            parsed = json.loads(cached_data)
-            parsed["cache_hit"] = True
-            return MarketRiskMetric(**parsed)
-    except Exception:
-        pass
+    now = time.monotonic()
+    with market_metric_cache_lock:
+        cached = market_metric_cache.get(ticker_clean)
+        if cached and cached[0] > now:
+            return cached[1].model_copy(update={"cache_hit": True})
 
-    if ticker_clean == "GRAM-ALTIN-TRY":
-        gold = yf.Ticker("GC=F")
-        usdtry = yf.Ticker("USDTRY=X")
+    if ticker_clean in BINANCE_SPOT_SYMBOLS:
+        res_obj = process_binance_ticker(ticker_clean)
+    elif ticker_clean == "GRAM-ALTIN-TRY":
+        gold_daily, gold_intraday = get_market_history("GC=F")
+        fx_daily, fx_intraday = get_market_history("USDTRY=X")
 
-        gold_hist = gold.history(period="1mo", interval="1d")
-        usd_hist = usdtry.history(period="1mo", interval="1d")
+        gold_quote = float(gold_intraday["Close"].iloc[-1])
+        fx_quote = float(fx_intraday["Close"].iloc[-1])
+        current_price = gold_quote * fx_quote / 31.1034768
 
-        if gold_hist.empty or usd_hist.empty:
-            raise ValueError("Synthetic gold data unavailable")
-
-        gold_close = gold_hist["Close"].ffill()
-        usd_close = usd_hist["Close"].ffill()
-
-        latest_gold = float(gold_close.iloc[-1])
-        prev_gold = (
-            float(gold_close.iloc[-2]) if len(gold_close) >= 2 else latest_gold
-        )
-        latest_usd = float(usd_close.iloc[-1])
-        prev_usd = float(usd_close.iloc[-2]) if len(usd_close) >= 2 else latest_usd
-
-        current_price = (latest_gold * latest_usd) / 31.1034768
-        prev_price = (prev_gold * prev_usd) / 31.1034768
-        change_pct = round(((current_price - prev_price) / prev_price) * 100, 2)
-
-        res_obj = MarketRiskMetric(
+        gold_closes = gold_daily["Close"].copy()
+        fx_closes = fx_daily["Close"].copy()
+        gold_closes.index = pd.to_datetime(gold_closes.index.date)
+        fx_closes.index = pd.to_datetime(fx_closes.index.date)
+        aligned = pd.concat(
+            [gold_closes.rename("gold"), fx_closes.rename("fx")], axis=1
+        ).dropna()
+        gram_history = aligned["gold"] * aligned["fx"] / 31.1034768
+        if gram_history.empty:
+            raise ValueError("Could not align gold and USD/TRY history")
+        previous_price = float(gram_history.iloc[-1])
+        if len(gram_history) > 1:
+            previous_price = float(gram_history.iloc[-2])
+        change_pct = (current_price - previous_price) / previous_price * 100
+        data_as_of = min(gold_intraday.index[-1], fx_intraday.index[-1])
+        res_obj = build_metric(
             ticker="GRAM-ALTIN-TRY",
-            price=round(current_price, 2),
-            change_percent=change_pct,
+            price=current_price,
+            change_pct=change_pct,
             currency="TRY",
-            fifty_day_average=round(current_price * 0.96, 2),
-            rsi_14=62.4,
-            momentum_status="Neutral",
-            generated_at=datetime.datetime.utcnow().isoformat(),
-            cache_hit=False,
+            daily_closes=gram_history,
+            data_as_of=data_as_of,
+            source="Yahoo Finance: GC=F futures × USDTRY=X ÷ 31.1035 (indicative gram estimate)",
         )
     else:
-        stock = yf.Ticker(ticker_clean)
-        hist = stock.history(period="1mo", interval="1d")
+        daily, intraday = get_market_history(ticker_clean)
+        daily_closes = daily["Close"].dropna()
+        if len(daily_closes) < 2:
+            raise ValueError(f"Insufficient daily data for {ticker_clean}")
 
-        if hist.empty or len(hist) < 2:
-            raise ValueError(f"Insufficient data for {ticker_clean}")
-
-        current_price = float(hist["Close"].iloc[-1])
-        prev_close = float(hist["Close"].iloc[-2])
-        change_pct = round(((current_price - prev_close) / prev_close) * 100, 2)
-
-        rsi_series = calculate_rsi(hist["Close"], period=14)
-        last_rsi = (
-            float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
-        )
-        rsi_val = round(last_rsi, 2)
-
-        info = stock.fast_info
-        fifty_avg = (
-            float(info.fifty_day_average)
-            if info.fifty_day_average
-            else current_price
-        )
-        currency = str(info.currency) if info.currency else "USD"
-
-        if rsi_val >= 70:
-            status_desc = "Overbought"
-        elif rsi_val <= 30:
-            status_desc = "Oversold"
-        else:
-            status_desc = "Neutral"
-
-        res_obj = MarketRiskMetric(
+        current_price = float(intraday["Close"].iloc[-1])
+        prev_close = float(daily_closes.iloc[-2])
+        change_pct = (current_price - prev_close) / prev_close * 100
+        try:
+            currency = str(yf.Ticker(ticker_clean).fast_info.currency or "USD")
+        except Exception:
+            currency = "USD"
+        res_obj = build_metric(
             ticker=ticker_clean,
-            price=round(current_price, 2),
-            change_percent=change_pct,
+            price=current_price,
+            change_pct=change_pct,
             currency=currency,
-            fifty_day_average=round(fifty_avg, 2),
-            rsi_14=rsi_val,
-            momentum_status=status_desc,
-            generated_at=datetime.datetime.utcnow().isoformat(),
-            cache_hit=False,
+            daily_closes=daily_closes,
+            data_as_of=intraday.index[-1],
+            source="Yahoo Finance intraday quote",
         )
 
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                engine_mem.setex(cache_key, 60, res_obj.model_dump_json()), loop
-            ).result(timeout=1.0)
-        else:
-            loop.run_until_complete(
-                engine_mem.setex(cache_key, 60, res_obj.model_dump_json())
-            )
-    except Exception:
-        pass
+    with market_metric_cache_lock:
+        market_metric_cache[ticker_clean] = (time.monotonic() + 15, res_obj)
 
     return res_obj
 
@@ -619,8 +670,9 @@ async def health_check():
     latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
     return {
         "status": "operational",
-        "redis_connected": True,
-        "redis_error": None,
+        "redis_connected": False,
+        "cache_backend": "process-local in-memory",
+        "redis_error": "Redis is not configured; process-local memory is used.",
         "latency_ms": latency_ms,
         "version": "4.0.0",
     }
@@ -882,17 +934,63 @@ async def serve_dashboard():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>AlphaMetrics | Quant Terminal</title>
         <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
-            body { font-family: 'JetBrains Mono', monospace; background-color: #0b0f19; color: #f3f4f6; }
+            :root {
+                color-scheme: dark;
+                --canvas: #080b12;
+                --panel: rgba(15, 20, 31, .88);
+                --line: rgba(148, 163, 184, .13);
+                --muted: #8993a5;
+                --mint: #67e8bd;
+            }
+            * { box-sizing: border-box; }
+            body {
+                font-family: 'DM Sans', sans-serif;
+                background: radial-gradient(ellipse at 50% -18%, rgba(16, 185, 129, .13), transparent 40%),
+                            radial-gradient(ellipse at 100% 45%, rgba(56, 189, 248, .045), transparent 34%), var(--canvas);
+                color: #e8edf5;
+                letter-spacing: -.01em;
+            }
+            body::before {
+                content: ''; position: fixed; inset: 0; pointer-events: none; opacity: .14;
+                background-image: linear-gradient(rgba(148,163,184,.045) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,.045) 1px, transparent 1px);
+                background-size: 48px 48px; mask-image: linear-gradient(to bottom, black, transparent 80%);
+            }
+            .max-w-5xl { max-width: 1280px; position: relative; }
+            h1, h2, h3 { letter-spacing: -.045em; }
+            section, .bg-gray-900.border, #quantModal > div {
+                backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+                box-shadow: 0 18px 60px rgba(0,0,0,.24);
+            }
+            section:first-of-type { background: linear-gradient(120deg, rgba(16, 35, 35, .92), rgba(13, 19, 29, .9) 64%, rgba(11, 23, 29, .92)); }
+            section:nth-of-type(2) { background: linear-gradient(135deg, rgba(17, 23, 35, .92), rgba(12, 17, 27, .88)); }
+            #watchlistBody tr { transition: background .18s ease, transform .18s ease; }
+            #watchlistBody tr:hover { background: rgba(103, 232, 189, .045); }
+            thead th { font-size: 10px; letter-spacing: .12em; white-space: nowrap; }
+            input { transition: border-color .18s ease, box-shadow .18s ease; }
+            input:focus { box-shadow: 0 0 0 3px rgba(103, 232, 189, .1); }
+            button { transition: transform .16s ease, background-color .16s ease, border-color .16s ease, box-shadow .16s ease; }
+            button:hover { transform: translateY(-1px); }
+            #quantModal > div { background: rgba(13, 19, 30, .97); }
+            @media (max-width: 640px) {
+                body { padding: 18px !important; }
+                section { padding: 16px !important; }
+                #watchlistBody td, thead th { padding-left: 12px; padding-right: 12px; }
+            }
         </style>
     </head>
     <body class="min-h-screen p-4 sm:p-8 flex justify-center">
         <div class="w-full max-w-5xl">
-            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-800 pb-6 mb-6">
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-800/80 pb-6 mb-7">
                 <div>
-                    <h1 class="text-2xl font-bold text-emerald-400 tracking-wide">AlphaMetrics Terminal</h1>
-                    <p class="text-xs text-gray-500 mt-1">Real-Time Risk & Quant Execution Engine (v4.0)</p>
+                    <div class="flex items-center gap-3">
+                        <span class="flex h-10 w-10 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-emerald-300 text-lg font-bold">α</span>
+                        <div>
+                            <h1 class="text-2xl font-bold text-white">Alpha<span class="text-emerald-300">Metrics</span></h1>
+                            <p class="text-xs text-gray-500 mt-1">Quant intelligence <span class="mx-1 text-gray-700">/</span> Terminal v4.0</p>
+                        </div>
+                    </div>
                 </div>
                 <div class="flex items-center gap-2">
                     <span id="connBadge" class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
@@ -908,17 +1006,17 @@ async def serve_dashboard():
                 <div class="flex items-center justify-between mb-3 border-b border-gray-800/80 pb-2">
                     <div class="flex items-center gap-2">
                         <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping"></span>
-                        <span class="text-xs font-bold uppercase tracking-wider text-emerald-400">NovaOrderBook HFT Live Risk Matrix</span>
+                        <span class="text-xs font-bold uppercase tracking-wider text-emerald-300">Binance BTC/USDT <span class="text-gray-500">/</span> Live market feed</span>
                     </div>
-                    <span id="hftStatus" class="text-[10px] text-gray-400 font-mono">Listening to LOB Stream...</span>
+                    <span id="hftStatus" class="text-[10px] text-gray-400 font-mono">Connecting to Binance Spot...</span>
                 </div>
                 <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
                     <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
-                        <span class="text-[10px] text-gray-500 uppercase block">Last Spot</span>
+                            <span class="text-[10px] text-gray-500 uppercase block">BTC / USDT mid</span>
                         <b id="hftPrice" class="text-sm text-white font-mono">--</b>
                     </div>
                     <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
-                        <span class="text-[10px] text-gray-500 uppercase block">VaR 95% (Tick)</span>
+                            <span class="text-[10px] text-gray-500 uppercase block">10-tick VaR 95%</span>
                         <b id="hftVar95" class="text-sm text-amber-400 font-mono">--</b>
                     </div>
                     <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
@@ -926,11 +1024,11 @@ async def serve_dashboard():
                         <b id="hftCvar" class="text-sm text-red-400 font-mono">--</b>
                     </div>
                     <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
-                        <span class="text-[10px] text-gray-500 uppercase block">LOB Spread</span>
+                            <span class="text-[10px] text-gray-500 uppercase block">Best bid/ask spread</span>
                         <b id="hftSpread" class="text-sm text-emerald-400 font-mono">--</b>
                     </div>
                     <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
-                        <span class="text-[10px] text-gray-500 uppercase block">OFI Imbalance</span>
+                            <span class="text-[10px] text-gray-500 uppercase block">Top-book imbalance</span>
                         <b id="hftOfi" class="text-sm text-cyan-400 font-mono">--</b>
                     </div>
                 </div>
@@ -938,14 +1036,15 @@ async def serve_dashboard():
 
             <section class="bg-gray-900/60 border border-gray-800 rounded-xl p-5 mb-6 shadow-xl">
                 <div class="flex items-center justify-between mb-3">
-                    <span class="text-xs font-bold uppercase tracking-wider text-emerald-400">B2B API Key Inspector & Quota Manager</span>
-                    <span class="text-[11px] text-gray-500">Live Auth Subsystem</span>
+                    <span class="text-xs font-bold uppercase tracking-wider text-emerald-300">API access & usage</span>
+                    <span class="text-[11px] text-gray-500">Client workspace</span>
                 </div>
-                <div class="flex gap-2">
+                <p class="text-xs text-gray-500 mb-3">Inspect your plan, rate limit and remaining monthly requests.</p>
+                <div class="flex flex-col sm:flex-row gap-2">
                     <input id="keyInspectorInput" type="text" placeholder="Enter X-API-Key (e.g. starter_..., enterprise_...)" 
                            class="flex-1 bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 font-mono text-gray-200">
-                    <button onclick="inspectApiKey()" class="bg-emerald-600 hover:bg-emerald-500 text-black font-bold px-4 py-2 rounded-lg text-xs transition">
-                        Verify Key
+                        <button onclick="inspectApiKey()" class="bg-emerald-400 hover:bg-emerald-300 text-gray-950 font-bold px-4 py-2 rounded-lg text-xs transition shadow-lg shadow-emerald-950/30">
+                        Check access
                     </button>
                 </div>
                 <div id="inspectorResult" class="hidden mt-3 bg-gray-950/80 border border-gray-800 rounded-lg p-3 text-xs font-mono">
@@ -958,7 +1057,7 @@ async def serve_dashboard():
                 </div>
             </section>
 
-            <div class="flex gap-2 mb-6">
+            <div class="flex flex-col sm:flex-row gap-2 mb-4">
                 <input id="newTicker" type="text" placeholder="Add Symbol (e.g. INTC, AMZN, PLTR)" 
                        class="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 uppercase tracking-wider">
                 <button onclick="addCustomTicker()" class="bg-emerald-500 hover:bg-emerald-400 text-black font-bold px-6 py-3 rounded-lg text-sm transition">
@@ -966,6 +1065,13 @@ async def serve_dashboard():
                 </button>
             </div>
 
+            <div class="flex items-end justify-between gap-3 mb-3 px-1">
+                <div>
+                    <h2 class="text-lg font-semibold text-gray-100">Market watchlist</h2>
+                    <p class="text-xs text-gray-500 mt-1">Live pricing, momentum and risk signals</p>
+                </div>
+                <span class="hidden sm:inline-flex items-center gap-2 text-[10px] uppercase tracking-widest text-gray-500"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span> Streaming</span>
+            </div>
             <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-2xl">
                 <div class="overflow-x-auto">
                     <table class="w-full text-left text-sm">
@@ -1035,23 +1141,36 @@ async def serve_dashboard():
             let ws = null;
             let hftWs = null;
 
+            function formatQuoteTime(value) {
+                if (!value) return 'time unavailable';
+                const date = new Date(value);
+                return Number.isNaN(date.getTime()) ? 'time unavailable' : date.toLocaleTimeString();
+            }
+
             function connectHftWebSocket() {
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 const wsUrl = `${protocol}//${window.location.host}/ws/hft-risk`;
                 hftWs = new WebSocket(wsUrl);
 
                 hftWs.onopen = () => {
-                    document.getElementById('hftStatus').innerText = 'Connected: Live Ingestion Active';
+                    document.getElementById('hftStatus').innerText = 'Waiting for public market quote...';
                     document.getElementById('hftStatus').className = 'text-[10px] text-emerald-400 font-mono';
                 };
 
                 hftWs.onmessage = (event) => {
                     const d = JSON.parse(event.data);
-                    document.getElementById('hftPrice').innerText = d.current_price ? d.current_price.toFixed(2) : '--';
+                    if (d.status !== 'live') {
+                        document.getElementById('hftStatus').innerText = 'Binance quote unavailable';
+                        document.getElementById('hftStatus').className = 'text-[10px] text-red-400 font-mono';
+                        return;
+                    }
+                    document.getElementById('hftStatus').innerText = `Binance Spot · Updated ${formatQuoteTime(d.data_as_of)}`;
+                    document.getElementById('hftStatus').className = 'text-[10px] text-emerald-400 font-mono';
+                    document.getElementById('hftPrice').innerText = Number(d.current_price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
                     document.getElementById('hftVar95').innerText = d.var_95 ? d.var_95.toFixed(2) : '--';
                     document.getElementById('hftCvar').innerText = d.cvar_95 ? d.cvar_95.toFixed(2) : '--';
-                    document.getElementById('hftSpread').innerText = d.spread ? d.spread : '0';
-                    document.getElementById('hftOfi').innerText = d.ofi !== undefined ? d.ofi.toFixed(4) : '--';
+                    document.getElementById('hftSpread').innerText = Number(d.spread).toFixed(4);
+                    document.getElementById('hftOfi').innerText = Number(d.ofi).toFixed(4);
                 };
 
                 hftWs.onclose = () => {
@@ -1092,7 +1211,7 @@ async def serve_dashboard():
                     row.id = `row-${cleanId}`;
                     row.innerHTML = `
                         <td class="py-3.5 px-4 font-bold text-white">${ticker}</td>
-                        <td class="py-3.5 px-4 text-gray-500 text-xs animate-pulse">Streaming...</td>
+                        <td class="py-3.5 px-4 text-gray-500 text-xs animate-pulse">Waiting for quote...</td>
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
@@ -1128,7 +1247,7 @@ async def serve_dashboard():
 
                 row.innerHTML = `
                     <td class="py-3.5 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
-                    <td class="py-3.5 px-4 font-semibold text-white">${data.price} <span class="text-[10px] text-gray-500">${data.currency}</span></td>
+                    <td class="py-3.5 px-4 font-semibold text-white">${Number(data.price).toLocaleString(undefined, {maximumFractionDigits: 8})} <span class="text-[10px] text-gray-500">${data.currency}</span><span class="block text-[9px] font-normal text-gray-500" title="${data.quote_source}">${formatQuoteTime(data.data_as_of)} · ${data.quote_source}</span></td>
                     <td class="py-3.5 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
                     <td class="py-3.5 px-4 text-gray-400">${data.fifty_day_average}</td>
                     <td class="py-3.5 px-4">
@@ -1231,6 +1350,7 @@ async def serve_dashboard():
                 initLayout();
                 connectWebSocket();
                 connectHftWebSocket();
+                setInterval(requestStreamAll, 60000);
             };
         </script>
     </body>
