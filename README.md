@@ -67,3 +67,13 @@ uvicorn main:app --reload --port 8000
 * **Worker:** Asynchronous tick-by-tick risk processor via Redis consumer groups.
 * **Metrics:** Live Value at Risk (VaR 95%), Expected Shortfall (CVaR), and Level-2 LOB Spread.
 * **Telemetry:** Broadcasts via Redis Pub/Sub to FastAPI WebSockets (`/ws/hft-risk`).
+
+## Security Configuration
+
+The API sends baseline browser security headers and limits browser CORS access
+to the Render app and local development origins by default. Set
+`ALPHAMETRICS_ALLOWED_ORIGINS` to a comma-separated allowlist when using a
+separate frontend. The mock billing tier-upgrade endpoint is disabled unless
+`BILLING_WEBHOOK_SECRET` is configured and the matching
+`X-Billing-Webhook-Secret` header is sent. This mock endpoint is not a verified
+Stripe webhook integration.

@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 import datetime
 import json
 import os
+import secrets
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set
@@ -184,13 +185,33 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALPHAMETRICS_ALLOWED_ORIGINS",
+        "https://alpha-metrics-engine.onrender.com,http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Billing-Webhook-Secret"],
 )
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
@@ -744,7 +765,17 @@ def get_client_usage(
     }
 
 @app.post("/api/v1/billing/webhook", tags=["B2B Billing"])
-def stripe_mock_webhook(payload: WebhookPayload, db: Session = Depends(get_db)):
+def stripe_mock_webhook(
+    payload: WebhookPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    webhook_secret = os.getenv("BILLING_WEBHOOK_SECRET")
+    if not webhook_secret:
+        raise HTTPException(status_code=503, detail="Billing webhook is not configured")
+    supplied_secret = request.headers.get("X-Billing-Webhook-Secret", "")
+    if not secrets.compare_digest(supplied_secret, webhook_secret):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
     tier_quotas = {
         "starter": {"rpm": 60, "quota": 50000},
         "pro": {"rpm": 300, "quota": 500000},
