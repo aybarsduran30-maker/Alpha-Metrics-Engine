@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import datetime
 import json
+import logging
 import os
 import secrets
 import threading
@@ -32,6 +33,8 @@ import yfinance as yf
 from auth_service import generate_api_key, verify_api_key
 from database import Base, engine, get_db
 from models import ApiClient
+
+logger = logging.getLogger(__name__)
 
 Base.metadata.create_all(bind=engine)
 
@@ -129,8 +132,10 @@ def calculate_hft_risk_math(prices: list, horizon_ticks: int = 10, simulations: 
 
 async def background_lob_engine():
     prices = []
+    last_error_log_at = float("-inf")
     async with httpx.AsyncClient(timeout=5.0) as client:
         while True:
+            poll_delay = 1.0
             try:
                 response = await client.get(
                     "https://data-api.binance.vision/api/v3/ticker/bookTicker",
@@ -161,14 +166,26 @@ async def background_lob_engine():
                     "data_as_of": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 })
                 await engine_mem.broadcast_hft(json.dumps(metrics))
-            except Exception:
+            except Exception as exc:
+                poll_delay = 5.0
+                if isinstance(exc, httpx.HTTPStatusError):
+                    reason = f"Binance HTTP {exc.response.status_code}"
+                elif isinstance(exc, httpx.TimeoutException):
+                    reason = "Binance request timed out"
+                else:
+                    reason = "Binance market feed unavailable"
+                now = time.monotonic()
+                if now - last_error_log_at >= 60.0:
+                    logger.warning("Binance book ticker request failed: %s", exc)
+                    last_error_log_at = now
                 await engine_mem.broadcast_hft(json.dumps({
                     "status": "unavailable",
                     "symbol": "BTC/USDT",
                     "exchange": "Binance Spot",
+                    "reason": reason,
                     "data_as_of": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 }))
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(poll_delay)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -689,8 +706,14 @@ def run_correlation_matrix_sync(symbols: List[str]) -> PortfolioRiskAnalysis:
 async def health_check():
     start_time = time.perf_counter()
     latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    market_feed = json.loads(engine_mem._latest_hft_risk) if engine_mem._latest_hft_risk else {}
     return {
         "status": "operational",
+        "market_feed": {
+            "status": market_feed.get("status", "starting"),
+            "reason": market_feed.get("reason"),
+            "data_as_of": market_feed.get("data_as_of"),
+        },
         "redis_connected": False,
         "cache_backend": "process-local in-memory",
         "redis_error": "Redis is not configured; process-local memory is used.",
