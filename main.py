@@ -4,6 +4,7 @@ import datetime
 from email.message import EmailMessage
 import json
 import logging
+import math
 import os
 import secrets
 import smtplib
@@ -135,60 +136,104 @@ def calculate_hft_risk_math(prices: list, horizon_ticks: int = 10, simulations: 
 
 async def background_lob_engine():
     prices = []
-    last_error_log_at = float("-inf")
+    last_error_log_at: Dict[str, float] = {}
+    retry_after: Dict[str, float] = {}
+    active_exchange = None
     async with httpx.AsyncClient(timeout=5.0) as client:
         while True:
-            poll_delay = 1.0
-            try:
-                response = await client.get(
-                    "https://data-api.binance.vision/api/v3/ticker/bookTicker",
-                    params={"symbol": "BTCUSDT"},
-                )
-                response.raise_for_status()
-                quote = response.json()
-                best_bid = float(quote["bidPrice"])
-                best_ask = float(quote["askPrice"])
-                bid_size = float(quote["bidQty"])
-                ask_size = float(quote["askQty"])
-                current_price = (best_bid + best_ask) / 2
-                prices.append(current_price)
-                if len(prices) > 300:
+            published = False
+            for exchange in ("Binance Spot", "Coinbase Exchange", "Kraken Spot"):
+                if time.monotonic() < retry_after.get(exchange, 0):
+                    continue
+                try:
+                    best_bid, best_ask, bid_size, ask_size, data_as_of = (
+                        await fetch_top_of_book(client, exchange)
+                    )
+                    if exchange != active_exchange:
+                        prices = []  # Risk samples must come from the same venue.
+                        active_exchange = exchange
+                    current_price = (best_bid + best_ask) / 2
+                    prices.append(current_price)
                     prices = prices[-300:]
-
-                metrics = calculate_hft_risk_math(prices) or {}
-                metrics.update({
-                    "status": "live",
-                    "symbol": "BTC/USDT",
-                    "exchange": "Binance Spot",
-                    "current_price": current_price,
-                    "spread": best_ask - best_bid,
-                    "ofi": (bid_size - ask_size) / (bid_size + ask_size)
-                    if bid_size + ask_size else 0.0,
-                    "best_bid": best_bid,
-                    "best_ask": best_ask,
-                    "data_as_of": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                })
-                await engine_mem.broadcast_hft(json.dumps(metrics))
-            except Exception as exc:
-                poll_delay = 5.0
-                if isinstance(exc, httpx.HTTPStatusError):
-                    reason = f"Binance HTTP {exc.response.status_code}"
-                elif isinstance(exc, httpx.TimeoutException):
-                    reason = "Binance request timed out"
-                else:
-                    reason = "Binance market feed unavailable"
-                now = time.monotonic()
-                if now - last_error_log_at >= 60.0:
-                    logger.warning("Binance book ticker request failed: %s", exc)
-                    last_error_log_at = now
+                    metrics = calculate_hft_risk_math(prices) or {}
+                    metrics.update({
+                        "status": "live",
+                        "symbol": "BTC/USDT",
+                        "exchange": exchange,
+                        "current_price": current_price,
+                        "spread": best_ask - best_bid,
+                        "ofi": (bid_size - ask_size) / (bid_size + ask_size)
+                        if bid_size + ask_size else 0.0,
+                        "best_bid": best_bid,
+                        "best_ask": best_ask,
+                        "data_as_of": data_as_of,
+                    })
+                    await engine_mem.broadcast_hft(json.dumps(metrics))
+                    published = True
+                    break
+                except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+                    now = time.monotonic()
+                    blocked = isinstance(exc, httpx.HTTPStatusError) and (
+                        exc.response.status_code in (403, 418, 429, 451)
+                    )
+                    retry_after[exchange] = now + (600 if blocked else 30)
+                    if now - last_error_log_at.get(exchange, float("-inf")) >= 60:
+                        logger.warning("%s order-book request failed: %s", exchange, exc)
+                        last_error_log_at[exchange] = now
+            if not published:
                 await engine_mem.broadcast_hft(json.dumps({
                     "status": "unavailable",
                     "symbol": "BTC/USDT",
-                    "exchange": "Binance Spot",
-                    "reason": reason,
+                    "reason": "Public BTC/USDT order-book feeds unavailable",
                     "data_as_of": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 }))
-            await asyncio.sleep(poll_delay)
+            await asyncio.sleep(2 if published else 5)
+
+
+async def fetch_top_of_book(client: httpx.AsyncClient, exchange: str):
+    """Return bid, ask, sizes and source timestamp for a real BTC/USDT book."""
+    if exchange == "Binance Spot":
+        response = await client.get(
+            "https://data-api.binance.vision/api/v3/ticker/bookTicker",
+            params={"symbol": "BTCUSDT"},
+        )
+        response.raise_for_status()
+        book = response.json()
+        bid, ask = book["bidPrice"], book["askPrice"]
+        bid_qty, ask_qty = book["bidQty"], book["askQty"]
+        as_of = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    elif exchange == "Coinbase Exchange":
+        response = await client.get(
+            "https://api.exchange.coinbase.com/products/BTC-USDT/book",
+            params={"level": 1},
+        )
+        response.raise_for_status()
+        book = response.json()
+        bid, bid_qty = book["bids"][0][:2]
+        ask, ask_qty = book["asks"][0][:2]
+        as_of = book["time"]
+    elif exchange == "Kraken Spot":
+        response = await client.get(
+            "https://api.kraken.com/0/public/Depth",
+            params={"pair": "XBTUSDT", "count": 1},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload["error"]:
+            raise ValueError("Kraken returned an order-book error")
+        book = payload["result"]["XBTUSDT"]
+        bid, bid_qty = book["bids"][0][:2]
+        ask, ask_qty = book["asks"][0][:2]
+        as_of = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    else:
+        raise ValueError(f"Unknown exchange: {exchange}")
+
+    values = tuple(map(float, (bid, ask, bid_qty, ask_qty)))
+    if not all(map(math.isfinite, values)) or values[0] <= 0 or values[1] < values[0]:
+        raise ValueError(f"Invalid {exchange} top-of-book quote")
+    if values[2] < 0 or values[3] < 0:
+        raise ValueError(f"Invalid {exchange} top-of-book size")
+    return (*values, as_of)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1268,7 +1313,7 @@ async def serve_dashboard():
                         <a href="#api-access" class="rounded-lg bg-emerald-400 px-4 py-2.5 text-sm font-bold text-gray-950 hover:bg-emerald-300">Get a free API key</a>
                         <a href="/docs" class="rounded-lg border border-gray-700 px-4 py-2.5 text-sm font-semibold text-gray-200 hover:border-gray-500">Explore API docs</a>
                     </div>
-                    <p class="mt-4 text-xs leading-5 text-gray-500">Public demo data only. BTC/USDT top-of-book data is sourced from Binance Spot; watchlist quotes are sourced from Yahoo Finance. This is a research and engineering demo, not investment advice.</p>
+                    <p class="mt-4 text-xs leading-5 text-gray-500">Public demo data only. BTC/USDT top-of-book data comes from the exchange named in the live feed; watchlist quotes use public exchange and Yahoo Finance data. This is a research and engineering demo, not investment advice.</p>
                 </div>
             </section>
 
@@ -1276,9 +1321,9 @@ async def serve_dashboard():
                 <div class="flex items-center justify-between mb-3 border-b border-gray-800/80 pb-2">
                     <div class="flex items-center gap-2">
                         <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping"></span>
-                        <span class="text-xs font-bold uppercase tracking-wider text-emerald-300">Binance BTC/USDT <span class="text-gray-500">/</span> Live market feed</span>
+                        <span class="text-xs font-bold uppercase tracking-wider text-emerald-300">BTC/USDT <span class="text-gray-500">/</span> Live market feed</span>
                     </div>
-                    <span id="hftStatus" class="text-[10px] text-gray-400 font-mono">Connecting to Binance Spot...</span>
+                    <span id="hftStatus" class="text-[10px] text-gray-400 font-mono">Connecting to public order book...</span>
                 </div>
                 <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
                     <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
@@ -1554,7 +1599,7 @@ async def serve_dashboard():
                         }
                         return;
                     }
-                    document.getElementById('hftStatus').innerText = `Binance Spot · Updated ${formatQuoteTime(d.data_as_of)}`;
+                    document.getElementById('hftStatus').innerText = `${d.exchange} · Updated ${formatQuoteTime(d.data_as_of)}`;
                     document.getElementById('hftStatus').className = 'text-[10px] text-emerald-400 font-mono';
                     document.getElementById('hftPrice').innerText = Number(d.current_price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
                     document.getElementById('hftVar95').innerText = d.var_95 ? d.var_95.toFixed(2) : '--';
