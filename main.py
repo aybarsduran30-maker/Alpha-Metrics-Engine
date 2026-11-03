@@ -1,13 +1,16 @@
 import asyncio
 from contextlib import asynccontextmanager
 import datetime
+from email.message import EmailMessage
 import json
 import logging
 import os
 import secrets
+import smtplib
+import ssl
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -26,13 +29,13 @@ from fastapi.responses import HTMLResponse
 import numpy as np
 import pandas as pd
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 import yfinance as yf
 
-from auth_service import generate_api_key, verify_api_key
+from auth_service import find_client_by_api_key, generate_api_key, hash_api_key, verify_api_key
 from database import Base, engine, get_db
-from models import ApiClient
+from models import ApiClient, EmailVerification
 
 logger = logging.getLogger(__name__)
 
@@ -236,18 +239,30 @@ async def rate_limit_middleware(request: Request, call_next):
         return await call_next(request)
 
     client_ip = request.client.host if request.client else "unknown"
-    if await engine_mem.is_rate_limited(client_ip, limit=60, window=60):
+    request_limits = {
+        "/api/v1/auth/register": 5,
+        "/api/v1/auth/verify-email": 10,
+    }
+    request_limit = request_limits.get(request.url.path, 60)
+    if request.url.path.startswith("/api/v1/demo/quant/backtest/"):
+        request_limit = 5
+    if await engine_mem.is_rate_limited(client_ip, limit=request_limit, window=60):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded. Maximum 60 requests per minute.",
+            detail=f"Rate limit exceeded. Maximum {request_limit} requests per minute.",
         )
 
     return await call_next(request)
 
 class ClientRegisterSchema(BaseModel):
     company_name: str
-    email: str
-    tier: str = "starter"
+    email: EmailStr
+    tier: Literal["starter"] = "starter"
+
+
+class VerifyEmailSchema(BaseModel):
+    email: EmailStr
+    token: str
 
 class MarketRiskMetric(BaseModel):
     ticker: str
@@ -272,6 +287,15 @@ class BacktestResult(BaseModel):
     total_trades: int
     win_rate_pct: float
     analysis_date: str
+
+
+DEMO_BACKTEST_TICKERS = frozenset({
+    "GC=F", "USDTRY=X", "VUAA.L", "QQQ", "^GSPC", "NVDA", "AAPL",
+    "MSFT", "AMZN", "GOOGL", "TSLA", "AMD", "THYAO.IS", "ASELS.IS",
+    "EREGL.IS", "MBG.DE", "BMW.DE", "BTC-USD", "ETH-USD", "SOL-USD",
+})
+demo_backtest_cache: Dict[str, tuple[float, BacktestResult]] = {}
+demo_backtest_cache_lock = threading.Lock()
 
 class PortfolioRiskAnalysis(BaseModel):
     assets: List[str]
@@ -721,51 +745,184 @@ async def health_check():
         "version": "4.0.0",
     }
 
+def send_email_verification(email: str, token: str) -> None:
+    resend_api_key = os.getenv("RESEND_API_KEY")
+    from_email = os.getenv("RESEND_FROM_EMAIL") or os.getenv("SMTP_FROM_EMAIL")
+    if not from_email:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Email verification is unavailable because the sender is not configured.",
+        )
+
+    body = (
+        "Your AlphaMetrics verification code is:\n\n"
+        f"{token}\n\n"
+        "It expires in 15 minutes. Enter it in POST /api/v1/auth/verify-email "
+        "to finish registration. If you did not request this, ignore this email."
+    )
+    if resend_api_key:
+        try:
+            response = httpx.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {resend_api_key}"},
+                json={
+                    "from": from_email,
+                    "to": [email],
+                    "subject": "Verify your AlphaMetrics email",
+                    "text": body,
+                },
+                timeout=10.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Could not deliver the verification email. Please try again later.",
+            ) from exc
+        return
+
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_username = os.getenv("SMTP_USERNAME")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    if not all((smtp_host, smtp_username, smtp_password)):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Email verification is unavailable because no delivery provider is configured.",
+        )
+
+    try:
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="Email verification is misconfigured.") from exc
+
+    message = EmailMessage()
+    message["Subject"] = "Verify your AlphaMetrics email"
+    message["From"] = from_email
+    message["To"] = email
+    message.set_content(body)
+
+    try:
+        timeout = 10
+        if os.getenv("SMTP_USE_SSL", "false").strip().lower() == "true":
+            with smtplib.SMTP_SSL(
+                smtp_host, smtp_port, timeout=timeout, context=ssl.create_default_context()
+            ) as server:
+                server.login(smtp_username, smtp_password)
+                server.send_message(message)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout) as server:
+                server.starttls(context=ssl.create_default_context())
+                server.login(smtp_username, smtp_password)
+                server.send_message(message)
+    except (OSError, smtplib.SMTPException) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not deliver the verification email. Please try again later.",
+        ) from exc
+
+
 @app.post(
     "/api/v1/auth/register",
-    status_code=status.HTTP_201_CREATED,
+    status_code=status.HTTP_202_ACCEPTED,
     tags=["B2B Auth"],
+    description=(
+        "Sends a one-time verification code. No client or API key is created "
+        "until the email address is verified."
+    ),
 )
 def register_client(
     payload: ClientRegisterSchema, db: Session = Depends(get_db)
 ):
+    company_name = payload.company_name.strip()
+    email = str(payload.email).strip().lower()
+    if not company_name or len(company_name) > 100:
+        raise HTTPException(status_code=422, detail="Company name must be 1–100 characters.")
+    if len(email) > 100:
+        raise HTTPException(status_code=422, detail="Email address must be 100 characters or fewer.")
+
+    if db.query(ApiClient.id).filter(ApiClient.email == email).first():
+        raise HTTPException(status_code=409, detail="This email is already registered.")
+
+    token = secrets.token_urlsafe(32)
+    pending = db.query(EmailVerification).filter(EmailVerification.email == email).first()
+    if pending is None:
+        pending = EmailVerification(email=email, company_name=company_name)
+        db.add(pending)
+    pending.company_name = company_name
+    pending.token_hash = hash_api_key(token)
+    pending.expires_at_epoch = time.time() + 15 * 60
+
     try:
-        tier_quotas = {
-            "starter": {"rpm": 60, "quota": 50000},
-            "pro": {"rpm": 300, "quota": 500000},
-            "enterprise": {"rpm": 1200, "quota": 5000000},
-        }
-        tier = payload.tier.lower()
-        config = tier_quotas.get(tier, tier_quotas["starter"])
-
-        key = generate_api_key(tier)
-        client = ApiClient()
-        client.company_name = payload.company_name
-        client.email = payload.email
-        client.api_key = key
-        client.plan_tier = tier
-        client.rate_limit_per_min = config["rpm"]
-        client.monthly_quota = config["quota"]
-        client.used_requests_this_month = 0
-        client.is_active = True
-
-        db.add(client)
+        send_email_verification(email, token)
         db.commit()
-        db.refresh(client)
-        return {
-            "status": "success",
-            "company": client.company_name,
-            "email": client.email,
-            "api_key": client.api_key,
-            "tier": client.plan_tier,
-            "monthly_quota": client.monthly_quota,
-        }
-    except Exception as e:
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
         db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Registration failed: {str(e)}",
-        )
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not start email verification. Please try again later.",
+        ) from exc
+
+    return {
+        "status": "verification_sent",
+        "message": "Check your inbox and verify your email within 15 minutes.",
+    }
+
+
+@app.post(
+    "/api/v1/auth/verify-email",
+    status_code=status.HTTP_201_CREATED,
+    tags=["B2B Auth"],
+    description=(
+        "Verifies the email code, creates a Starter client, and returns its "
+        "API key once."
+    ),
+)
+def verify_registration_email(
+    payload: VerifyEmailSchema, db: Session = Depends(get_db)
+):
+    email = str(payload.email).strip().lower()
+    pending = db.query(EmailVerification).filter(EmailVerification.email == email).first()
+    if (
+        pending is None
+        or pending.expires_at_epoch <= time.time()
+        or not secrets.compare_digest(pending.token_hash, hash_api_key(payload.token))
+    ):
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
+
+    tier = "starter"
+    key = generate_api_key(tier)
+    client = ApiClient(
+        company_name=pending.company_name,
+        email=email,
+        api_key_hash=hash_api_key(key),
+        plan_tier=tier,
+        rate_limit_per_min=60,
+        monthly_quota=50000,
+        used_requests_this_month=0,
+        is_active=True,
+    )
+    try:
+        db.add(client)
+        db.delete(pending)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Registration could not be completed. Request a new verification code.",
+        ) from exc
+
+    return {
+        "status": "success",
+        "company": client.company_name,
+        "email": client.email,
+        "api_key": key,
+        "tier": client.plan_tier,
+        "monthly_quota": client.monthly_quota,
+    }
 
 @app.get(
     "/api/v1/auth/usage",
@@ -808,7 +965,7 @@ def stripe_mock_webhook(
     if target_tier not in tier_quotas:
         raise HTTPException(status_code=400, detail="Invalid tier name")
 
-    client = db.query(ApiClient).filter(ApiClient.api_key == payload.api_key).first()
+    client = find_client_by_api_key(db, payload.api_key)
     if not client:
         raise HTTPException(status_code=404, detail="API client not found")
 
@@ -855,6 +1012,45 @@ async def get_metrics(
         return metric
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(
+    "/api/v1/demo/quant/backtest/{ticker}",
+    response_model=BacktestResult,
+    tags=["Public Demo"],
+    description=(
+        "Rate-limited public backtest for the dashboard watchlist. "
+        "Use the authenticated endpoint for general API access."
+    ),
+)
+async def get_demo_backtest(ticker: str):
+    ticker_clean = ticker.upper()
+    if ticker_clean not in DEMO_BACKTEST_TICKERS:
+        raise HTTPException(
+            status_code=404,
+            detail="This symbol is not available in the public demo. Use an API key for custom symbols.",
+        )
+
+    now = time.monotonic()
+    with demo_backtest_cache_lock:
+        cached = demo_backtest_cache.get(ticker_clean)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, run_quant_backtest_sync, ticker_clean
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Market data is temporarily unavailable for this symbol. Please try again later.",
+        ) from exc
+
+    with demo_backtest_cache_lock:
+        demo_backtest_cache[ticker_clean] = (time.monotonic() + 300, result)
+    return result
+
 
 @app.get(
     "/api/v1/quant/backtest/{ticker}",
@@ -986,7 +1182,7 @@ async def serve_dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AlphaMetrics | Quant Terminal</title>
+        <title>AlphaMetrics | Market Risk API</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
@@ -1019,6 +1215,7 @@ async def serve_dashboard():
             }
             section:first-of-type { background: linear-gradient(120deg, rgba(16, 35, 35, .92), rgba(13, 19, 29, .9) 64%, rgba(11, 23, 29, .92)); }
             section:nth-of-type(2) { background: linear-gradient(135deg, rgba(17, 23, 35, .92), rgba(12, 17, 27, .88)); }
+            .hero { background: linear-gradient(120deg, rgba(16, 35, 35, .92), rgba(13, 19, 29, .94) 64%, rgba(11, 23, 29, .92)); }
             #watchlistBody tr { transition: background .18s ease, transform .18s ease; }
             #watchlistBody tr:hover { background: rgba(103, 232, 189, .045); }
             thead th { font-size: 10px; letter-spacing: .12em; white-space: nowrap; }
@@ -1048,7 +1245,7 @@ async def serve_dashboard():
                 </div>
                 <div class="flex items-center gap-2">
                     <span id="connBadge" class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
-                        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> WS Connected
+                        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> Dashboard connected
                     </span>
                     <button onclick="requestStreamAll()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
                         Stream Sync
@@ -1056,7 +1253,26 @@ async def serve_dashboard():
                 </div>
             </div>
 
-            <section class="bg-gray-900/80 border border-emerald-500/30 rounded-xl p-5 mb-6 shadow-2xl relative overflow-hidden">
+            <nav aria-label="Main navigation" class="flex flex-wrap items-center gap-x-5 gap-y-2 mb-6 text-sm text-gray-400">
+                <a class="hover:text-white" href="#market">Live market</a>
+                <a class="hover:text-white" href="#api-access">API access</a>
+                <a class="hover:text-white" href="/docs">Documentation</a>
+            </nav>
+
+            <section class="hero border border-emerald-500/20 rounded-2xl p-6 sm:p-9 mb-6">
+                <div class="max-w-3xl">
+                    <span class="inline-flex items-center rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-300">Market data · risk analytics · developer API</span>
+                    <h2 class="mt-4 text-3xl sm:text-4xl font-bold leading-tight text-white">Market risk signals, ready for your workflow.</h2>
+                    <p class="mt-3 max-w-2xl text-sm sm:text-base leading-7 text-gray-400">Explore live public market data, inspect quantitative indicators, and try the AlphaMetrics API with a free Starter key.</p>
+                    <div class="mt-6 flex flex-wrap gap-3">
+                        <a href="#api-access" class="rounded-lg bg-emerald-400 px-4 py-2.5 text-sm font-bold text-gray-950 hover:bg-emerald-300">Get a free API key</a>
+                        <a href="/docs" class="rounded-lg border border-gray-700 px-4 py-2.5 text-sm font-semibold text-gray-200 hover:border-gray-500">Explore API docs</a>
+                    </div>
+                    <p class="mt-4 text-xs leading-5 text-gray-500">Public demo data only. BTC/USDT top-of-book data is sourced from Binance Spot; watchlist quotes are sourced from Yahoo Finance. This is a research and engineering demo, not investment advice.</p>
+                </div>
+            </section>
+
+            <section id="market" class="bg-gray-900/80 border border-emerald-500/30 rounded-xl p-5 mb-6 shadow-2xl relative overflow-hidden">
                 <div class="flex items-center justify-between mb-3 border-b border-gray-800/80 pb-2">
                     <div class="flex items-center gap-2">
                         <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping"></span>
@@ -1088,19 +1304,53 @@ async def serve_dashboard():
                 </div>
             </section>
 
-            <section class="bg-gray-900/60 border border-gray-800 rounded-xl p-5 mb-6 shadow-xl">
+            <section id="api-access" class="bg-gray-900/60 border border-gray-800 rounded-xl p-5 mb-6 shadow-xl">
                 <div class="flex items-center justify-between mb-3">
-                    <span class="text-xs font-bold uppercase tracking-wider text-emerald-300">API access & usage</span>
-                    <span class="text-[11px] text-gray-500">Client workspace</span>
+                    <div>
+                        <span class="text-xs font-bold uppercase tracking-wider text-emerald-300">Start building</span>
+                        <h2 class="mt-1 text-xl font-semibold text-white">Get your Starter API key</h2>
+                    </div>
+                    <a href="/docs" class="text-xs text-emerald-300 hover:text-emerald-200">Read API docs ↗</a>
                 </div>
-                <p class="text-xs text-gray-500 mb-3">Inspect your plan, rate limit and remaining monthly requests.</p>
-                <div class="flex flex-col sm:flex-row gap-2">
-                    <input id="keyInspectorInput" type="text" placeholder="Enter X-API-Key (e.g. starter_..., enterprise_...)" 
-                           class="flex-1 bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-emerald-500 font-mono text-gray-200">
-                        <button onclick="inspectApiKey()" class="bg-emerald-400 hover:bg-emerald-300 text-gray-950 font-bold px-4 py-2 rounded-lg text-xs transition shadow-lg shadow-emerald-950/30">
-                        Check access
-                    </button>
+                <p class="text-sm text-gray-400 mb-5">Verify your email to create a trial client. Your API key is shown once, after verification.</p>
+                <form id="signupForm" onsubmit="requestApiKey(event)" class="grid gap-3 sm:grid-cols-2">
+                    <label class="text-xs text-gray-400">Company or project name
+                        <input id="signupCompany" required maxlength="100" autocomplete="organization" placeholder="e.g. Northstar Labs" class="mt-1 w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2.5 text-sm text-gray-100 focus:outline-none focus:border-emerald-500">
+                    </label>
+                    <label class="text-xs text-gray-400">Work email
+                        <input id="signupEmail" required type="email" maxlength="100" autocomplete="email" placeholder="you@company.com" class="mt-1 w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2.5 text-sm text-gray-100 focus:outline-none focus:border-emerald-500">
+                    </label>
+                    <div class="sm:col-span-2 flex flex-wrap items-center gap-3">
+                        <button id="signupButton" type="submit" class="rounded-lg bg-emerald-400 px-4 py-2.5 text-sm font-bold text-gray-950 hover:bg-emerald-300">Send verification code</button>
+                        <p id="signupStatus" role="status" aria-live="polite" class="text-sm text-gray-400"></p>
+                    </div>
+                </form>
+                <form id="verifyForm" onsubmit="verifyApiEmail(event)" class="hidden mt-4 rounded-xl border border-gray-800 bg-gray-950/70 p-4">
+                    <p class="text-sm text-gray-300">Enter the code sent to <b id="verificationEmail" class="text-white"></b>.</p>
+                    <div class="mt-3 flex flex-col gap-2 sm:flex-row">
+                        <input id="verificationCode" required autocomplete="one-time-code" inputmode="text" placeholder="Verification code" class="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-3 py-2.5 text-sm font-mono text-gray-100 focus:outline-none focus:border-emerald-500">
+                        <button id="verifyButton" type="submit" class="rounded-lg bg-emerald-400 px-4 py-2.5 text-sm font-bold text-gray-950 hover:bg-emerald-300">Verify email</button>
+                    </div>
+                    <p id="verifyStatus" role="status" aria-live="polite" class="mt-2 text-sm text-gray-400"></p>
+                </form>
+                <div id="apiKeyResult" class="hidden mt-4 rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-4">
+                    <p class="text-sm font-semibold text-emerald-300">Email verified. Your Starter API key is ready.</p>
+                    <p class="mt-1 text-xs text-gray-400">Copy and save it now. For security, it cannot be shown again.</p>
+                    <div class="mt-3 flex flex-col gap-2 sm:flex-row">
+                        <code id="newApiKey" class="flex-1 overflow-x-auto rounded-lg bg-gray-950 px-3 py-2.5 text-xs text-white"></code>
+                        <button type="button" onclick="copyNewApiKey()" class="rounded-lg border border-gray-700 px-4 py-2 text-sm font-semibold text-gray-200 hover:border-gray-500">Copy key</button>
+                    </div>
+                    <p id="copyStatus" role="status" class="mt-2 text-xs text-gray-400"></p>
                 </div>
+
+                <details class="mt-6 border-t border-gray-800 pt-4">
+                    <summary class="cursor-pointer text-sm font-semibold text-gray-300 hover:text-white">Already have an API key? Check your usage</summary>
+                    <p class="text-xs text-gray-500 mt-3 mb-3">Inspect your plan, rate limit, and remaining monthly requests.</p>
+                    <div class="flex flex-col sm:flex-row gap-2">
+                        <input id="keyInspectorInput" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste your API key" class="flex-1 bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500 font-mono text-gray-200">
+                        <button onclick="inspectApiKey()" class="bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-100 font-semibold px-4 py-2 rounded-lg text-sm">Check usage</button>
+                    </div>
+                </details>
                 <div id="inspectorResult" class="hidden mt-3 bg-gray-950/80 border border-gray-800 rounded-lg p-3 text-xs font-mono">
                     <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
                         <div><span class="text-gray-500">Company:</span> <b id="statCompany" class="text-white block">-</b></div>
@@ -1137,7 +1387,7 @@ async def serve_dashboard():
                                 <th class="py-3.5 px-4">50D Avg</th>
                                 <th class="py-3.5 px-4">14D RSI</th>
                                 <th class="py-3.5 px-4">Status</th>
-                                <th class="py-3.5 px-4 text-right">Quant Actions</th>
+                                <th class="py-3.5 px-4 text-right">Backtest</th>
                             </tr>
                         </thead>
                         <tbody id="watchlistBody" class="divide-y divide-gray-800">
@@ -1151,9 +1401,14 @@ async def serve_dashboard():
             <div class="bg-[#0f172a] border border-gray-800 w-full max-w-lg rounded-xl p-6 relative">
                 <button onclick="closeModal()" class="absolute top-4 right-4 text-gray-400 hover:text-white text-lg font-bold">&times;</button>
                 <div id="modalContent">
-                    <p class="text-xs text-gray-500 uppercase tracking-wider">Algorithmic Backtest & Risk Engine</p>
+                    <p class="text-xs text-gray-500 uppercase tracking-wider">1-year RSI strategy backtest</p>
                     <h3 id="modalTicker" class="text-xl font-bold text-emerald-400 mt-1">--</h3>
-                    <div id="modalLoading" class="py-8 text-center text-xs text-gray-400 animate-pulse">Running Quantitative Models...</div>
+                    <p class="mt-2 text-xs leading-5 text-gray-500">RSI 14 entry/exit rule on daily history. Excludes fees, slippage, and market impact; historical results do not predict future performance.</p>
+                    <div id="modalLoading" class="py-8 text-center text-xs text-gray-400 animate-pulse">Loading one-year RSI backtest…</div>
+                    <div id="modalError" role="alert" class="hidden mt-4 rounded-lg border border-amber-500/30 bg-amber-950/20 p-4 text-sm text-amber-200">
+                        <p id="modalErrorMessage"></p>
+                        <a href="#api-access" onclick="closeModal()" class="mt-3 inline-block text-xs font-semibold text-emerald-300 hover:text-emerald-200">Get an API key for more symbols →</a>
+                    </div>
                     <div id="modalResults" class="hidden mt-4 space-y-3">
                         <div class="grid grid-cols-2 gap-3">
                             <div class="bg-gray-900 p-3 rounded border border-gray-800">
@@ -1178,6 +1433,7 @@ async def serve_dashboard():
                             <span class="text-gray-400">Win Rate: <b id="mWinRate" class="text-emerald-400">--</b></span>
                         </div>
                     </div>
+                    <p id="modalAnalysisDate" class="mt-3 text-[10px] text-gray-500"></p>
                 </div>
             </div>
         </div>
@@ -1194,6 +1450,83 @@ async def serve_dashboard():
 
             let ws = null;
             let hftWs = null;
+            let sessionApiKey = null;
+
+            async function requestApiKey(event) {
+                event.preventDefault();
+                const button = document.getElementById('signupButton');
+                const status = document.getElementById('signupStatus');
+                const email = document.getElementById('signupEmail').value.trim().toLowerCase();
+                button.disabled = true;
+                button.textContent = 'Sending…';
+                status.textContent = '';
+                try {
+                    const response = await fetch('/api/v1/auth/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            company_name: document.getElementById('signupCompany').value.trim(),
+                            email,
+                            tier: 'starter'
+                        })
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data.detail || `Request failed (${response.status})`);
+                    document.getElementById('verificationEmail').textContent = email;
+                    document.getElementById('signupForm').classList.add('hidden');
+                    document.getElementById('verifyForm').classList.remove('hidden');
+                    document.getElementById('verificationCode').focus();
+                } catch (error) {
+                    status.textContent = error.message;
+                    status.className = 'text-sm text-red-300';
+                } finally {
+                    button.disabled = false;
+                    button.textContent = 'Send verification code';
+                }
+            }
+
+            async function verifyApiEmail(event) {
+                event.preventDefault();
+                const button = document.getElementById('verifyButton');
+                const status = document.getElementById('verifyStatus');
+                button.disabled = true;
+                button.textContent = 'Verifying…';
+                status.textContent = '';
+                try {
+                    const response = await fetch('/api/v1/auth/verify-email', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            email: document.getElementById('signupEmail').value.trim().toLowerCase(),
+                            token: document.getElementById('verificationCode').value.trim()
+                        })
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data.detail || `Verification failed (${response.status})`);
+                    sessionApiKey = data.api_key;
+                    document.getElementById('newApiKey').textContent = data.api_key;
+                    document.getElementById('verifyForm').classList.add('hidden');
+                    document.getElementById('apiKeyResult').classList.remove('hidden');
+                    document.getElementById('apiKeyResult').scrollIntoView({ behavior: 'smooth', block: 'center' });
+                } catch (error) {
+                    status.textContent = error.message;
+                    status.className = 'mt-2 text-sm text-red-300';
+                } finally {
+                    button.disabled = false;
+                    button.textContent = 'Verify email';
+                }
+            }
+
+            async function copyNewApiKey() {
+                const key = document.getElementById('newApiKey').textContent;
+                const status = document.getElementById('copyStatus');
+                try {
+                    await navigator.clipboard.writeText(key);
+                    status.textContent = 'Copied. Store your key somewhere safe.';
+                } catch {
+                    status.textContent = 'Copy was blocked by your browser. Select the key and copy it manually.';
+                }
+            }
 
             function formatQuoteTime(value) {
                 if (!value) return 'time unavailable';
@@ -1214,8 +1547,11 @@ async def serve_dashboard():
                 hftWs.onmessage = (event) => {
                     const d = JSON.parse(event.data);
                     if (d.status !== 'live') {
-                        document.getElementById('hftStatus').innerText = 'Binance quote unavailable';
+                        document.getElementById('hftStatus').innerText = d.reason || 'Market quote unavailable';
                         document.getElementById('hftStatus').className = 'text-[10px] text-red-400 font-mono';
+                        for (const id of ['hftPrice', 'hftVar95', 'hftCvar', 'hftSpread', 'hftOfi']) {
+                            document.getElementById(id).innerText = '--';
+                        }
                         return;
                     }
                     document.getElementById('hftStatus').innerText = `Binance Spot · Updated ${formatQuoteTime(d.data_as_of)}`;
@@ -1235,7 +1571,8 @@ async def serve_dashboard():
             }
 
             async function inspectApiKey() {
-                const key = document.getElementById('keyInspectorInput').value.trim();
+                const keyInput = document.getElementById('keyInspectorInput');
+                const key = keyInput.value.trim();
                 const resBox = document.getElementById('inspectorResult');
                 if (!key) { alert('Please enter an API Key'); return; }
 
@@ -1245,6 +1582,7 @@ async def serve_dashboard():
                     });
                     if (!res.ok) throw new Error(await res.text());
                     const data = await res.json();
+                    sessionApiKey = key;
                     resBox.classList.remove('hidden');
                     document.getElementById('statCompany').innerText = data.company;
                     document.getElementById('statTier').innerText = data.plan_tier.toUpperCase();
@@ -1252,6 +1590,8 @@ async def serve_dashboard():
                     document.getElementById('statQuota').innerText = data.remaining_requests + ' / ' + data.monthly_quota;
                 } catch (err) {
                     alert('Authentication failed: ' + err.message);
+                } finally {
+                    keyInput.value = '';
                 }
             }
 
@@ -1272,7 +1612,7 @@ async def serve_dashboard():
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-right">
                             <button onclick="openQuantModal('${ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2.5 py-1 rounded transition">
-                                Quant Risk
+                                1Y Backtest
                             </button>
                         </td>
                     `;
@@ -1310,7 +1650,7 @@ async def serve_dashboard():
                     <td class="py-3.5 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
                     <td class="py-3.5 px-4 text-right">
                         <button onclick="openQuantModal('${data.ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2.5 py-1 rounded transition">
-                            Quant Risk
+                            1Y Backtest
                         </button>
                     </td>
                 `;
@@ -1324,7 +1664,7 @@ async def serve_dashboard():
                 ws.onopen = () => {
                     const badge = document.getElementById('connBadge');
                     badge.className = 'inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800';
-                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> WS Connected';
+                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> Dashboard connected';
                     requestStreamAll();
                 };
 
@@ -1364,33 +1704,51 @@ async def serve_dashboard():
                 const modal = document.getElementById('quantModal');
                 const loading = document.getElementById('modalLoading');
                 const results = document.getElementById('modalResults');
+                const errorBox = document.getElementById('modalError');
                 document.getElementById('modalTicker').innerText = ticker;
                 
                 modal.classList.remove('hidden');
                 modal.classList.add('flex');
                 loading.classList.remove('hidden');
+                loading.innerText = 'Loading one-year RSI backtest…';
+                errorBox.classList.add('hidden');
                 results.classList.add('hidden');
 
                 try {
-                    const res = await fetch(`/api/v1/quant/backtest/${ticker}`);
-                    const data = await res.json();
-                    
-                    const stratColor = data.strategy_return_pct >= 0 ? 'text-emerald-400' : 'text-red-400';
-                    const stratSign = data.strategy_return_pct >= 0 ? '+' : '';
-                    const bnhColor = data.buy_and_hold_return_pct >= 0 ? 'text-emerald-400' : 'text-red-400';
-                    const bnhSign = data.buy_and_hold_return_pct >= 0 ? '+' : '';
+                    const endpoint = sessionApiKey
+                        ? `/api/v1/quant/backtest/${encodeURIComponent(ticker)}`
+                        : `/api/v1/demo/quant/backtest/${encodeURIComponent(ticker)}`;
+                    const headers = sessionApiKey ? { 'X-API-Key': sessionApiKey } : {};
+                    const res = await fetch(endpoint, { headers });
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error(data.detail || `Analysis failed (${res.status})`);
 
-                    document.getElementById('mStratRet').innerHTML = `<span class="${stratColor}">${stratSign}${data.strategy_return_pct}%</span>`;
-                    document.getElementById('mBnhRet').innerHTML = `<span class="${bnhColor}">${bnhSign}${data.buy_and_hold_return_pct}%</span>`;
-                    document.getElementById('mSharpe').innerText = data.sharpe_ratio;
-                    document.getElementById('mDrawdown').innerText = `${data.max_drawdown_pct}%`;
-                    document.getElementById('mTrades').innerText = data.total_trades;
-                    document.getElementById('mWinRate').innerText = `${data.win_rate_pct}%`;
+                    const formatMetric = (value) => {
+                        const number = Number(value);
+                        return Number.isFinite(number) ? number.toFixed(2) : '—';
+                    };
+                    const strategyReturn = Number(data.strategy_return_pct);
+                    const buyAndHoldReturn = Number(data.buy_and_hold_return_pct);
+                    const stratColor = Number.isFinite(strategyReturn) && strategyReturn >= 0 ? 'text-emerald-400' : 'text-red-400';
+                    const stratSign = Number.isFinite(strategyReturn) && strategyReturn > 0 ? '+' : '';
+                    const bnhColor = Number.isFinite(buyAndHoldReturn) && buyAndHoldReturn >= 0 ? 'text-emerald-400' : 'text-red-400';
+                    const bnhSign = Number.isFinite(buyAndHoldReturn) && buyAndHoldReturn > 0 ? '+' : '';
+
+                    document.getElementById('mStratRet').innerHTML = `<span class="${stratColor}">${stratSign}${formatMetric(data.strategy_return_pct)}%</span>`;
+                    document.getElementById('mBnhRet').innerHTML = `<span class="${bnhColor}">${bnhSign}${formatMetric(data.buy_and_hold_return_pct)}%</span>`;
+                    document.getElementById('mSharpe').innerText = formatMetric(data.sharpe_ratio);
+                    document.getElementById('mDrawdown').innerText = `${formatMetric(data.max_drawdown_pct)}%`;
+                    document.getElementById('mTrades').innerText = Number.isFinite(Number(data.total_trades)) ? data.total_trades : '—';
+                    document.getElementById('mWinRate').innerText = `${formatMetric(data.win_rate_pct)}%`;
+                    const dateLabel = data.analysis_date ? new Date(data.analysis_date).toLocaleString() : 'time unavailable';
+                    document.getElementById('modalAnalysisDate').innerText = `Calculated ${dateLabel} · ${data.period || '1 Year'}`;
 
                     loading.classList.add('hidden');
                     results.classList.remove('hidden');
-                } catch {
-                    loading.innerText = 'Risk calculation failed for this asset.';
+                } catch (error) {
+                    loading.classList.add('hidden');
+                    document.getElementById('modalErrorMessage').textContent = error.message || 'Analysis is temporarily unavailable.';
+                    errorBox.classList.remove('hidden');
                 }
             }
 
@@ -1404,7 +1762,9 @@ async def serve_dashboard():
                 initLayout();
                 connectWebSocket();
                 connectHftWebSocket();
-                setInterval(requestStreamAll, 60000);
+                setInterval(() => {
+                    if (document.visibilityState === 'visible') requestStreamAll();
+                }, 60000);
             };
         </script>
     </body>

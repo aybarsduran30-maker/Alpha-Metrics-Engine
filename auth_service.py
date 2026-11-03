@@ -1,3 +1,4 @@
+import hashlib
 import secrets
 from fastapi import HTTPException, Security, status, Depends
 from fastapi.security.api_key import APIKeyHeader
@@ -9,8 +10,31 @@ API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 def generate_api_key(tier: str = "starter") -> str:
-    random_hex = secrets.token_hex(16)
+    random_hex = secrets.token_hex(32)
     return f"am_{tier}_{random_hex}"
+
+
+def hash_api_key(key: str) -> str:
+    """Return the stable, one-way representation stored in the database."""
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return f"sha256${digest}"
+
+
+def find_client_by_api_key(db: Session, key: str) -> ApiClient | None:
+    """Find a new hashed key or migrate a legacy plaintext key on first use."""
+    key_hash = hash_api_key(key)
+    client = db.query(ApiClient).filter(ApiClient.api_key_hash == key_hash).first()
+    if client:
+        return client
+
+    client = db.query(ApiClient).filter(ApiClient.api_key_hash == key).first()
+    if client:
+        client.api_key_hash = key_hash
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+    return client
 
 def verify_api_key(
     key: str = Security(api_key_header),
@@ -22,7 +46,7 @@ def verify_api_key(
             detail="API Key missing in request headers (X-API-Key required)"
         )
     
-    client = db.query(ApiClient).filter(ApiClient.api_key == key).first()
+    client = find_client_by_api_key(db, key)
     
     if not client:
         raise HTTPException(
