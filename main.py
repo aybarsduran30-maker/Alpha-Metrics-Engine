@@ -780,6 +780,7 @@ async def health_check():
         "status": "operational",
         "market_feed": {
             "status": market_feed.get("status", "starting"),
+            "exchange": market_feed.get("exchange"),
             "reason": market_feed.get("reason"),
             "data_as_of": market_feed.get("data_as_of"),
         },
@@ -820,6 +821,19 @@ def send_email_verification(email: str, token: str) -> None:
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
+            if isinstance(exc, httpx.HTTPStatusError):
+                try:
+                    error = exc.response.json()
+                    provider_error = error.get("message") or error.get("name")
+                except (ValueError, AttributeError):
+                    provider_error = None
+                logger.warning(
+                    "Resend rejected verification email: status=%s error=%s",
+                    exc.response.status_code,
+                    str(provider_error)[:300] if provider_error else "unknown",
+                )
+            else:
+                logger.warning("Resend verification request failed: %s", type(exc).__name__)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Could not deliver the verification email. Please try again later.",
