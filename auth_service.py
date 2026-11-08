@@ -2,6 +2,7 @@ import hashlib
 import secrets
 from fastapi import HTTPException, Security, status, Depends
 from fastapi.security.api_key import APIKeyHeader
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 from database import get_db
 from models import ApiClient
@@ -60,10 +61,23 @@ def verify_api_key(
             detail="API Key has been revoked or deactivated"
         )
         
-    if client.used_requests_this_month >= client.monthly_quota:
+    return client
+
+
+def consume_api_request(db: Session, client: ApiClient) -> None:
+    result = db.execute(
+        update(ApiClient)
+        .where(
+            ApiClient.id == client.id,
+            ApiClient.is_active.is_(True),
+            ApiClient.used_requests_this_month < ApiClient.monthly_quota,
+        )
+        .values(used_requests_this_month=ApiClient.used_requests_this_month + 1)
+    )
+    if result.rowcount != 1:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Monthly quota limit reached ({client.monthly_quota} requests)"
+            detail="API request quota reached.",
         )
-        
-    return client
+    db.commit()

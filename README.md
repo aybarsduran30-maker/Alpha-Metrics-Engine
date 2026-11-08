@@ -1,74 +1,76 @@
- AlphaMetrics Financial Intelligence & Execution Engine (v4.0)
+# AlphaMetrics — market data and risk research API
 
- [![Docker Image](https://img.shields.io/badge/Docker-Hub%20Image-blue.svg?style=flat&logo=docker&logoColor=white)](https://hub.docker.com/r/aybarsdrn/alphametrics)
+[![Docker Image](https://img.shields.io/badge/Docker-Hub%20Image-blue.svg?style=flat&logo=docker&logoColor=white)](https://hub.docker.com/r/aybarsdrn/alphametrics)
 
 [![AlphaMetrics CI Engine](https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine/actions/workflows/ci.yml)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110.0-009688.svg?style=flat&logo=FastAPI&logoColor=white)](https://fastapi.tiangolo.com)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg?style=flat&logo=python&logoColor=white)](https://www.python.org/)
-[![Redis](https://img.shields.io/badge/Redis-Upstash%20RAM%20Cache-DC382D.svg?style=flat&logo=redis&logoColor=white)](https://redis.io/)
 [![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0-D71F00.svg?style=flat&logo=sqlalchemy&logoColor=white)](https://www.sqlalchemy.org/)
 
-A high-throughput, asynchronous quantitative risk engine and enterprise API infrastructure built with FastAPI, Redis, SQLAlchemy, and WebSockets. Engineered to ingest streaming market feeds, execute heavy statistical risk modeling (Monte Carlo VaR/CVaR, Sharpe, Cross-Asset Correlation), and enforce multi-tenant API token provisioning with granular rate limits and monthly quota governance.
+AlphaMetrics is a FastAPI research prototype with a public market dashboard and an authenticated API. It calculates market indicators, Monte Carlo risk estimates, cross-asset correlations, and a simple RSI strategy backtest. API keys are issued after email verification. This codebase supports demos and limited pilots; see the limitations below before relying on it commercially.
 
 
 
- Live Production Links
-* **Interactive Quant Dashboard:** https://alpha-metrics-engine.onrender.com
-* **Interactive Swagger API Docs:** https://alpha-metrics-engine.onrender.com/docs
-* **System Health & Observability:** https://alpha-metrics-engine.onrender.com/health
+## Hosted links
+
+* [Dashboard](https://alpha-metrics-engine.onrender.com)
+* [API docs](https://alpha-metrics-engine.onrender.com/docs)
+* [Health check](https://alpha-metrics-engine.onrender.com/health)
 
 
 
 
- Key System Architecture
-* **Multi-Tenant Access Control:** Cryptographically secure API tokens for Starter, Pro, and Enterprise clients, with live consumption metering. Public registration issues Starter trial keys; paid tiers are provisioned through the billing flow.
-* **Tail-Risk Modeling Layer:** 10,000-iteration Monte Carlo engine generating Parametric Value at Risk (VaR 95/99) and Conditional Value at Risk (CVaR Expected Shortfall).
-* **Cross-Asset Correlation Analysis:** High-dimensional return matrices analyzing portfolio diversification and systemic market exposure.
-* **Distributed Caching & Ingestion:** Upstash Redis cache delivering sub-10ms response times and sliding-window rate limiting (60 req/min).
-* **Streaming Engine:** Asynchronous bi-directional WebSocket interface (`/ws/stream`) broadcasting real-time technical indicators.
+## Architecture
+* **API access:** Hashed API keys, email verification, and Starter usage tracking in PostgreSQL.
+* **Risk analytics:** Monte Carlo VaR/CVaR estimates, correlation matrices, and a one-year RSI backtest.
+* **Public demo:** A limited watchlist and backtest endpoint. The watchlist WebSocket sends a batch of quote snapshots.
+* **BTC/USDT top of book:** Separate WebSocket with Binance, Coinbase, and Kraken fallbacks. The selected venue and quote time appear in the dashboard.
+* **Cache and rate limits:** Process-local memory. State resets on restart and is not shared between multiple instances.
 
 
- API Endpoints Architecture
+## API endpoints
 
-Authentication & Tier Management
+### Authentication and tiers
 * `POST /api/v1/auth/register` - Sends an email verification code; it does not create a client or key.
 * `POST /api/v1/auth/verify-email` - Verifies the code, creates the Starter client, and returns its API key once.
-* `GET /api/v1/auth/usage` - Retrieves real-time token status, rate limits, consumed requests, and remaining monthly quota.
+* `GET /api/v1/auth/usage` - Retrieves token status, rate limits, consumed requests, and remaining trial quota.
 
-Quantitative & Market Risk Endpoints (Header: `X-API-Key`)
-* `GET /api/v1/metrics/{ticker}` - Ingests spot feeds and computes 14-Day RSI, 50D MA, and momentum states.
-* `GET /api/v1/quant/var/{ticker}` - Executes 10k Monte Carlo simulations for 1-day/multi-day VaR 95%, VaR 99%, and CVaR.
-* `GET /api/v1/quant/correlation` - Computes covariance and correlation matrix across multi-asset baskets (e.g. `?symbols=AAPL,TSLA,NVDA`).
-* `GET /api/v1/quant/backtest/{ticker}` - Backtests 1-year algorithmic strategies against Buy & Hold benchmarks (Sharpe, Win Rate, Max Drawdown).
+### Quantitative and market risk endpoints
+
+These endpoints require an `X-API-Key` header except for the public demo backtest and WebSocket.
+* `GET /api/v1/metrics/{ticker}` - Fetches a market snapshot and calculates RSI, 50-day average, and momentum state.
+* `GET /api/v1/quant/var/{ticker}` - Monte Carlo VaR/CVaR estimate. `days` is 1–30 and `simulations` is 500–20,000.
+* `GET /api/v1/quant/correlation` - Correlation matrix for 2–12 distinct symbols (e.g. `?symbols=AAPL,TSLA,NVDA`).
+* `GET /api/v1/quant/backtest/{ticker}` - One-year RSI strategy comparison with buy and hold. Results exclude transaction costs and market impact.
 * `GET /api/v1/demo/quant/backtest/{ticker}` - Public, IP-limited backtest for the dashboard watchlist only; cached for five minutes.
 * `GET /api/v1/reports/audit/{ticker}` - Generates an executive, printable quantitative risk audit report.
-* `WS /ws/stream` - Low-latency real-time market data WebSocket pipeline.
+* `WS /ws/stream` - Rate-limited, allowlisted public quote snapshots.
 
 ---
 
 ## Local Development & Testing
-Running Locally
+Create a virtual environment and install `requirements.txt`. Set `DATABASE_URL` and email settings as described below; SQLite is only a local default. `npm run build` checks Python syntax and installed Python dependencies, not a frontend bundle.
 
+On macOS or Linux:
 
 ```bash
-docker pull aybarsdrn/alphametrics:latest
-docker run -p 8000:8000 aybarsdrn/alphametrics:latest
-
-git clone [https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine.git](https://github.com/aybarsduran30-maker/Alpha-Metrics-Engine.git)
-cd Alpha-Metrics-Engine
-
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-
 uvicorn main:app --reload --port 8000
+```
 
+On Windows, activate with `.venv\Scripts\Activate.ps1` and use `python` instead of `python3`.
 
+## BTC/USDT risk display
+The background task polls the best bid and ask from public spot feeds and publishes snapshots on `/ws/hft-risk`. VaR and CVaR are model estimates from recent mid-price samples. They do not describe an executable trading strategy or a guaranteed loss bound. This is top-of-book data, not a Level-2 order book.
 
-## Real-Time Risk Subsystem
-* **Worker:** Asynchronous tick-by-tick risk processor via Redis consumer groups.
-* **Metrics:** Live Value at Risk (VaR 95%), Expected Shortfall (CVaR), and Level-2 LOB Spread.
-* **Telemetry:** Broadcasts via Redis Pub/Sub to FastAPI WebSockets (`/ws/hft-risk`).
+## Commercial pilot limits
+* No payment checkout or verified Stripe webhook. The billing endpoint is a shared-secret mock and must not be used as proof of payment.
+* New Starter keys have a 500-request trial quota. The existing `monthly_quota` API field is a legacy name; counters do not reset automatically. Do not advertise the current quota as a renewable subscription.
+* In-memory cache and rate limits need a shared store before multiple app instances or contractual uptime targets.
+* Public data sources can throttle or change terms. Confirm commercial redistribution rights and obtain a licensed feed before selling market data.
+* Backtests and risk estimates need independent model validation, operational monitoring, and customer-specific acceptance criteria before use in financial decisions.
 
 ## Security Configuration
 

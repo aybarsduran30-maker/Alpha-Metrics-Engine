@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import smtplib
 import ssl
@@ -20,13 +21,14 @@ from fastapi import (
     Depends,
     FastAPI,
     HTTPException,
+    Query,
     Request,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import numpy as np
 import pandas as pd
 import httpx
@@ -34,7 +36,7 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 import yfinance as yf
 
-from auth_service import find_client_by_api_key, generate_api_key, hash_api_key, verify_api_key
+from auth_service import consume_api_request, find_client_by_api_key, generate_api_key, hash_api_key, verify_api_key
 from database import Base, engine, get_db
 from models import ApiClient, EmailVerification
 
@@ -128,9 +130,9 @@ def calculate_hft_risk_math(prices: list, horizon_ticks: int = 10, simulations: 
         "current_price": round(current_price, 2),
         "tick_window": len(prices),
         "tick_volatility": round(std_ret, 6),
-        "var_95": round(abs(var_95), 4),
-        "var_99": round(abs(var_99), 4),
-        "cvar_95": round(abs(cvar_95), 4),
+        "var_95": round(max(0.0, -var_95), 4),
+        "var_99": round(max(0.0, -var_99), 4),
+        "cvar_95": round(max(0.0, -cvar_95), 4),
         "updated_at": time.time(),
     }
 
@@ -155,9 +157,12 @@ async def background_lob_engine():
                     current_price = (best_bid + best_ask) / 2
                     prices.append(current_price)
                     prices = prices[-300:]
-                    metrics = calculate_hft_risk_math(prices) or {}
+                    risk_metrics = calculate_hft_risk_math(prices)
+                    metrics = risk_metrics or {}
                     metrics.update({
                         "status": "live",
+                        "risk_status": "ready" if risk_metrics else "warming_up" if len(prices) < 15 else "flat_sample",
+                        "sample_count": len(prices),
                         "symbol": "BTC/USDT",
                         "exchange": exchange,
                         "current_price": current_price,
@@ -291,10 +296,12 @@ async def rate_limit_middleware(request: Request, call_next):
     request_limit = request_limits.get(request.url.path, 60)
     if request.url.path.startswith("/api/v1/demo/quant/backtest/"):
         request_limit = 5
-    if await engine_mem.is_rate_limited(client_ip, limit=request_limit, window=60):
-        raise HTTPException(
+    bucket = f"http:{request.url.path}:{client_ip}"
+    if await engine_mem.is_rate_limited(bucket, limit=request_limit, window=60):
+        return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Rate limit exceeded. Maximum {request_limit} requests per minute.",
+            content={"detail": f"Rate limit exceeded. Maximum {request_limit} requests per minute."},
+            headers={"Retry-After": "60"},
         )
 
     return await call_next(request)
@@ -339,8 +346,28 @@ DEMO_BACKTEST_TICKERS = frozenset({
     "MSFT", "AMZN", "GOOGL", "TSLA", "AMD", "THYAO.IS", "ASELS.IS",
     "EREGL.IS", "MBG.DE", "BMW.DE", "BTC-USD", "ETH-USD", "SOL-USD",
 })
+DEMO_STREAM_TICKERS = DEMO_BACKTEST_TICKERS | {"GRAM-ALTIN-TRY"}
+MAX_STREAM_TICKERS = 24
+TICKER_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9.^=_-]{0,31}$")
 demo_backtest_cache: Dict[str, tuple[float, BacktestResult]] = {}
 demo_backtest_cache_lock = threading.Lock()
+
+
+def normalize_ticker(ticker: str) -> str:
+    value = ticker.strip().upper()
+    if not TICKER_PATTERN.fullmatch(value):
+        raise HTTPException(status_code=422, detail="Invalid ticker symbol.")
+    return value
+
+
+def require_historical_ticker(ticker: str) -> str:
+    value = normalize_ticker(ticker)
+    if value == "GRAM-ALTIN-TRY":
+        raise HTTPException(
+            status_code=422,
+            detail="Historical gram-gold analysis is unavailable; use GC=F for gold futures.",
+        )
+    return value
 
 class PortfolioRiskAnalysis(BaseModel):
     assets: List[str]
@@ -461,7 +488,25 @@ def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
             return cached[1].model_copy(update={"cache_hit": True})
 
     if ticker_clean in BINANCE_SPOT_SYMBOLS:
-        res_obj = process_binance_ticker(ticker_clean)
+        try:
+            res_obj = process_binance_ticker(ticker_clean)
+        except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+            logger.warning("Binance quote failed for %s: %s", ticker_clean, type(exc).__name__)
+            daily, intraday = get_market_history(ticker_clean)
+            daily_closes = daily["Close"].dropna()
+            if len(daily_closes) < 2:
+                raise ValueError(f"Insufficient daily data for {ticker_clean}") from exc
+            current_price = float(intraday["Close"].iloc[-1])
+            prev_close = float(daily_closes.iloc[-2])
+            res_obj = build_metric(
+                ticker=ticker_clean,
+                price=current_price,
+                change_pct=(current_price - prev_close) / prev_close * 100,
+                currency="USD",
+                daily_closes=daily_closes,
+                data_as_of=intraday.index[-1],
+                source="Yahoo Finance crypto quote (Binance unavailable)",
+            )
     elif ticker_clean == "GRAM-ALTIN-TRY":
         gold_daily, gold_intraday = get_market_history("GC=F")
         fx_daily, fx_intraday = get_market_history("USDTRY=X")
@@ -518,7 +563,7 @@ def process_single_ticker_sync(ticker_clean: str) -> MarketRiskMetric:
         )
 
     with market_metric_cache_lock:
-        market_metric_cache[ticker_clean] = (time.monotonic() + 15, res_obj)
+        market_metric_cache[ticker_clean] = (time.monotonic() + 60, res_obj)
 
     return res_obj
 
@@ -537,8 +582,7 @@ def run_quant_backtest_sync(ticker_clean: str) -> BacktestResult:
     except Exception:
         pass
 
-    fetch_ticker = "GC=F" if ticker_clean == "GRAM-ALTIN-TRY" else ticker_clean
-    stock = yf.Ticker(fetch_ticker)
+    stock = yf.Ticker(ticker_clean)
     df = stock.history(period="1y", interval="1d")
 
     if df.empty or len(df) < 50:
@@ -556,6 +600,8 @@ def run_quant_backtest_sync(ticker_clean: str) -> BacktestResult:
         rsi = df["RSI"].iloc[i]
         price = df["Close"].iloc[i]
 
+        strategy_returns.append(df["Daily_Return"].iloc[i] if position == 1 else 0.0)
+
         if position == 0 and rsi < 35:
             position = 1
             entry_price = price
@@ -563,11 +609,6 @@ def run_quant_backtest_sync(ticker_clean: str) -> BacktestResult:
             position = 0
             ret = (price - entry_price) / entry_price
             trades.append(ret)
-
-        if position == 1:
-            strategy_returns.append(df["Daily_Return"].iloc[i])
-        else:
-            strategy_returns.append(0.0)
 
     df["Strategy_Return"] = strategy_returns
     df["Cum_Strategy"] = (1 + df["Strategy_Return"]).cumprod()
@@ -578,9 +619,9 @@ def run_quant_backtest_sync(ticker_clean: str) -> BacktestResult:
     )
     total_bnh_return = round((float(df["Cum_BnH"].iloc[-1]) - 1.0) * 100, 2)
 
-    active_returns = df.loc[df["Strategy_Return"] != 0, "Strategy_Return"]
-    if len(active_returns) > 5 and active_returns.std() > 0:
-        sharpe = (active_returns.mean() / active_returns.std()) * np.sqrt(252)
+    strategy_daily_returns = df["Strategy_Return"]
+    if len(strategy_daily_returns) > 5 and strategy_daily_returns.std() > 0:
+        sharpe = (strategy_daily_returns.mean() / strategy_daily_returns.std()) * np.sqrt(252)
         sharpe_val = round(float(sharpe), 2)
     else:
         sharpe_val = 0.0
@@ -639,8 +680,7 @@ def run_monte_carlo_var_sync(
     except Exception:
         pass
 
-    fetch_ticker = "GC=F" if ticker_clean == "GRAM-ALTIN-TRY" else ticker_clean
-    stock = yf.Ticker(fetch_ticker)
+    stock = yf.Ticker(ticker_clean)
     df = stock.history(period="1y", interval="1d")
 
     if df.empty or len(df) < 50:
@@ -681,13 +721,13 @@ def run_monte_carlo_var_sync(
         "volatility_annualized_pct": round(
             float(std_dev * np.sqrt(252) * 100), 2
         ),
-        "var_95_max_loss": round(abs(var_95), 2),
-        "var_99_max_loss": round(abs(var_99), 2),
-        "cvar_95_expected_shortfall": round(abs(cvar_95), 2),
-        "cvar_99_expected_shortfall": round(abs(cvar_99), 2),
+        "var_95_max_loss": round(max(0.0, -var_95), 2),
+        "var_99_max_loss": round(max(0.0, -var_99), 2),
+        "cvar_95_expected_shortfall": round(max(0.0, -cvar_95), 2),
+        "cvar_99_expected_shortfall": round(max(0.0, -cvar_99), 2),
         "risk_summary": (
-            f"With 95% statistical confidence, expected loss over {days} day(s)"
-            f" will not exceed {abs(round(var_95, 2))} units."
+            f"Model estimate: the 5th percentile price change over {days} day(s)"
+            f" implies a loss of {round(max(0.0, -var_95), 2)} price units."
         ),
     }
 
@@ -723,8 +763,7 @@ def run_correlation_matrix_sync(symbols: List[str]) -> PortfolioRiskAnalysis:
 
     price_series = {}
     for s in symbols:
-        fetch_sym = "GC=F" if s == "GRAM-ALTIN-TRY" else s
-        stock = yf.Ticker(fetch_sym)
+        stock = yf.Ticker(s)
         hist = stock.history(period="6mo", interval="1d")
         if not hist.empty and len(hist) > 20:
             price_series[s] = hist["Close"].pct_change().dropna()
@@ -959,7 +998,7 @@ def verify_registration_email(
         api_key_hash=hash_api_key(key),
         plan_tier=tier,
         rate_limit_per_min=60,
-        monthly_quota=50000,
+        monthly_quota=500,
         used_requests_this_month=0,
         is_active=True,
     )
@@ -1016,7 +1055,7 @@ def stripe_mock_webhook(
     if not secrets.compare_digest(supplied_secret, webhook_secret):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
     tier_quotas = {
-        "starter": {"rpm": 60, "quota": 50000},
+        "starter": {"rpm": 60, "quota": 500},
         "pro": {"rpm": 300, "quota": 500000},
         "enterprise": {"rpm": 1200, "quota": 5000000},
     }
@@ -1051,10 +1090,8 @@ async def get_metrics(
     client: ApiClient = Depends(verify_api_key),
     db: Session = Depends(get_db),
 ):
-    client.used_requests_this_month += 1
-    db.commit()
-
-    ticker_clean = ticker.upper()
+    ticker_clean = normalize_ticker(ticker)
+    consume_api_request(db, client)
     try:
         loop = asyncio.get_event_loop()
         metric = await loop.run_in_executor(
@@ -1069,8 +1106,9 @@ async def get_metrics(
             metric.momentum_status,
         )
         return metric
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.warning("Metric request failed for %s: %s", ticker_clean, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Market data is temporarily unavailable.") from exc
 
 @app.get(
     "/api/v1/demo/quant/backtest/{ticker}",
@@ -1082,7 +1120,7 @@ async def get_metrics(
     ),
 )
 async def get_demo_backtest(ticker: str):
-    ticker_clean = ticker.upper()
+    ticker_clean = normalize_ticker(ticker)
     if ticker_clean not in DEMO_BACKTEST_TICKERS:
         raise HTTPException(
             status_code=404,
@@ -1121,37 +1159,35 @@ async def get_backtest(
     client: ApiClient = Depends(verify_api_key),
     db: Session = Depends(get_db),
 ):
-    client.used_requests_this_month += 1
-    db.commit()
-
-    ticker_clean = ticker.upper()
+    ticker_clean = require_historical_ticker(ticker)
+    consume_api_request(db, client)
     try:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None, run_quant_backtest_sync, ticker_clean
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.warning("Backtest failed for %s: %s", ticker_clean, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Backtest data is temporarily unavailable.") from exc
 
 @app.get("/api/v1/quant/var/{ticker}", tags=["B2B Endpoints"])
 async def get_var_cvar(
     ticker: str,
-    days: int = 1,
-    simulations: int = 10000,
+    days: int = Query(1, ge=1, le=30),
+    simulations: int = Query(10000, ge=500, le=20000),
     client: ApiClient = Depends(verify_api_key),
     db: Session = Depends(get_db),
 ):
-    client.used_requests_this_month += 1
-    db.commit()
-
-    ticker_clean = ticker.upper()
+    ticker_clean = require_historical_ticker(ticker)
+    consume_api_request(db, client)
     try:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None, run_monte_carlo_var_sync, ticker_clean, days, simulations
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.warning("VaR calculation failed for %s: %s", ticker_clean, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Risk data is temporarily unavailable.") from exc
 
 @app.get(
     "/api/v1/quant/correlation",
@@ -1163,10 +1199,7 @@ async def get_correlation_matrix(
     client: ApiClient = Depends(verify_api_key),
     db: Session = Depends(get_db),
 ):
-    client.used_requests_this_month += 1
-    db.commit()
-
-    raw_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    raw_list = [require_historical_ticker(s) for s in symbols.split(",") if s.strip()]
     if len(raw_list) < 2:
         raise HTTPException(
             status_code=400,
@@ -1175,13 +1208,17 @@ async def get_correlation_matrix(
                 " ?symbols=AAPL,TSLA,NVDA)"
             ),
         )
+    if len(raw_list) > 12 or len(set(raw_list)) != len(raw_list):
+        raise HTTPException(status_code=422, detail="Provide 2–12 distinct ticker symbols.")
+    consume_api_request(db, client)
     try:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None, run_correlation_matrix_sync, raw_list
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.warning("Correlation request failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Correlation data is temporarily unavailable.") from exc
 
 @app.websocket("/ws/stream")
 async def websocket_stream_endpoint(websocket: WebSocket):
@@ -1190,11 +1227,40 @@ async def websocket_stream_endpoint(websocket: WebSocket):
     try:
         while True:
             raw_msg = await websocket.receive_text()
-            payload = json.loads(raw_msg)
-            tickers = payload.get("tickers", [])
+            if len(raw_msg) > 2048:
+                await websocket.send_json({"status": "error", "message": "Request is too large."})
+                continue
+            try:
+                payload = json.loads(raw_msg)
+            except json.JSONDecodeError:
+                await websocket.send_json({"status": "error", "message": "Invalid JSON."})
+                continue
+            tickers = payload.get("tickers") if isinstance(payload, dict) else None
+            if not isinstance(tickers, list) or not 1 <= len(tickers) <= MAX_STREAM_TICKERS:
+                await websocket.send_json({"status": "error", "message": "Send 1–24 demo symbols."})
+                continue
 
+            client_ip = websocket.client.host if websocket.client else "unknown"
+            if await engine_mem.is_rate_limited(f"demo-ws:{client_ip}", limit=6, window=60):
+                await websocket.close(code=1008, reason="Demo refresh limit reached")
+                return
+
+            seen: set[str] = set()
             for ticker in tickers:
-                clean_ticker = ticker.upper()
+                if not isinstance(ticker, str):
+                    await websocket.send_json({"status": "error", "message": "Invalid symbol."})
+                    continue
+                try:
+                    clean_ticker = normalize_ticker(ticker)
+                except HTTPException:
+                    await websocket.send_json({"status": "error", "ticker": ticker[:32], "message": "Invalid symbol."})
+                    continue
+                if clean_ticker in seen:
+                    continue
+                seen.add(clean_ticker)
+                if clean_ticker not in DEMO_STREAM_TICKERS:
+                    await websocket.send_json({"status": "error", "ticker": clean_ticker, "message": "Symbol unavailable in public demo."})
+                    continue
                 try:
                     metric = await loop.run_in_executor(
                         None, process_single_ticker_sync, clean_ticker
@@ -1202,9 +1268,10 @@ async def websocket_stream_endpoint(websocket: WebSocket):
                     await websocket.send_json(
                         {"status": "success", "data": metric.model_dump()}
                     )
-                except Exception as ex:
+                except Exception as exc:
+                    logger.warning("Demo quote failed for %s: %s", clean_ticker, type(exc).__name__)
                     await websocket.send_json(
-                        {"status": "error", "ticker": clean_ticker, "message": str(ex)}
+                        {"status": "error", "ticker": clean_ticker, "message": "Quote temporarily unavailable."}
                     )
                 await asyncio.sleep(0.05)
     except WebSocketDisconnect:
@@ -1241,7 +1308,7 @@ async def serve_dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AlphaMetrics | Market Risk API</title>
+        <title>AlphaMetrics | Market Risk Research API</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
@@ -1282,7 +1349,11 @@ async def serve_dashboard():
             input:focus { box-shadow: 0 0 0 3px rgba(103, 232, 189, .1); }
             button { transition: transform .16s ease, background-color .16s ease, border-color .16s ease, box-shadow .16s ease; }
             button:hover { transform: translateY(-1px); }
+            button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; }
             #quantModal > div { background: rgba(13, 19, 30, .97); }
+            @media (prefers-reduced-motion: reduce) {
+                *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+            }
             @media (max-width: 640px) {
                 body { padding: 18px !important; }
                 section { padding: 16px !important; }
@@ -1298,16 +1369,16 @@ async def serve_dashboard():
                         <span class="flex h-10 w-10 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-emerald-300 text-lg font-bold">α</span>
                         <div>
                             <h1 class="text-2xl font-bold text-white">Alpha<span class="text-emerald-300">Metrics</span></h1>
-                            <p class="text-xs text-gray-500 mt-1">Quant intelligence <span class="mx-1 text-gray-700">/</span> Terminal v4.0</p>
+                            <p class="text-xs text-gray-500 mt-1">Market risk research API <span class="mx-1 text-gray-700">/</span> Tarn Dynamics</p>
                         </div>
                     </div>
                 </div>
                 <div class="flex items-center gap-2">
-                    <span id="connBadge" class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
-                        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> Dashboard connected
+                    <span id="connBadge" role="status" aria-live="polite" class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-gray-900 text-gray-400 border border-gray-700">
+                        <span class="w-2 h-2 rounded-full bg-gray-400 mr-2"></span> Connecting
                     </span>
                     <button onclick="requestStreamAll()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
-                        Stream Sync
+                        Refresh quotes
                     </button>
                 </div>
             </div>
@@ -1321,11 +1392,17 @@ async def serve_dashboard():
             <section class="hero border border-emerald-500/20 rounded-2xl p-6 sm:p-9 mb-6">
                 <div class="max-w-3xl">
                     <span class="inline-flex items-center rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-300">Market data · risk analytics · developer API</span>
-                    <h2 class="mt-4 text-3xl sm:text-4xl font-bold leading-tight text-white">Market risk signals, ready for your workflow.</h2>
-                    <p class="mt-3 max-w-2xl text-sm sm:text-base leading-7 text-gray-400">Explore live public market data, inspect quantitative indicators, and try the AlphaMetrics API with a free Starter key.</p>
+                    <h2 class="mt-4 text-3xl sm:text-4xl font-bold leading-tight text-white">Market data and risk models you can inspect and integrate.</h2>
+                    <p class="mt-3 max-w-2xl text-sm sm:text-base leading-7 text-gray-400">Explore public market snapshots, review quantitative outputs, and test the API with a free Starter key.</p>
                     <div class="mt-6 flex flex-wrap gap-3">
                         <a href="#api-access" class="rounded-lg bg-emerald-400 px-4 py-2.5 text-sm font-bold text-gray-950 hover:bg-emerald-300">Get a free API key</a>
                         <a href="/docs" class="rounded-lg border border-gray-700 px-4 py-2.5 text-sm font-semibold text-gray-200 hover:border-gray-500">Explore API docs</a>
+                        <a href="mailto:aybarsduran30@gmail.com?subject=AlphaMetrics%20pilot" class="rounded-lg border border-gray-700 px-4 py-2.5 text-sm font-semibold text-gray-200 hover:border-gray-500">Discuss a pilot</a>
+                    </div>
+                    <div class="mt-6 grid gap-3 sm:grid-cols-3 text-xs text-gray-300">
+                        <div class="rounded-lg border border-emerald-500/15 bg-gray-950/40 p-3"><b class="block text-emerald-300">Risk estimates</b><span class="mt-1 block text-gray-400">VaR and expected shortfall from historical data.</span></div>
+                        <div class="rounded-lg border border-emerald-500/15 bg-gray-950/40 p-3"><b class="block text-emerald-300">Portfolio context</b><span class="mt-1 block text-gray-400">Cross-asset correlation for a selected basket.</span></div>
+                        <div class="rounded-lg border border-emerald-500/15 bg-gray-950/40 p-3"><b class="block text-emerald-300">Strategy checks</b><span class="mt-1 block text-gray-400">A reproducible one-year RSI backtest.</span></div>
                     </div>
                     <p class="mt-4 text-xs leading-5 text-gray-500">Public demo data only. BTC/USDT top-of-book data comes from the exchange named in the live feed; watchlist quotes use public exchange and Yahoo Finance data. This is a research and engineering demo, not investment advice.</p>
                 </div>
@@ -1334,7 +1411,7 @@ async def serve_dashboard():
             <section id="market" class="bg-gray-900/80 border border-emerald-500/30 rounded-xl p-5 mb-6 shadow-2xl relative overflow-hidden">
                 <div class="flex items-center justify-between mb-3 border-b border-gray-800/80 pb-2">
                     <div class="flex items-center gap-2">
-                        <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping"></span>
+                        <span id="hftDot" class="w-2.5 h-2.5 rounded-full bg-gray-500"></span>
                         <span class="text-xs font-bold uppercase tracking-wider text-emerald-300">BTC/USDT <span class="text-gray-500">/</span> Live market feed</span>
                     </div>
                     <span id="hftStatus" class="text-[10px] text-gray-400 font-mono">Connecting to public order book...</span>
@@ -1345,7 +1422,7 @@ async def serve_dashboard():
                         <b id="hftPrice" class="text-sm text-white font-mono">--</b>
                     </div>
                     <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
-                            <span class="text-[10px] text-gray-500 uppercase block">10-tick VaR 95%</span>
+                            <span class="text-[10px] text-gray-500 uppercase block">10-snapshot VaR 95%</span>
                         <b id="hftVar95" class="text-sm text-amber-400 font-mono">--</b>
                     </div>
                     <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
@@ -1376,7 +1453,7 @@ async def serve_dashboard():
                     <label class="text-xs text-gray-400">Company or project name
                         <input id="signupCompany" required maxlength="100" autocomplete="organization" placeholder="e.g. Northstar Labs" class="mt-1 w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2.5 text-sm text-gray-100 focus:outline-none focus:border-emerald-500">
                     </label>
-                    <label class="text-xs text-gray-400">Work email
+                    <label class="text-xs text-gray-400">Email
                         <input id="signupEmail" required type="email" maxlength="100" autocomplete="email" placeholder="you@company.com" class="mt-1 w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2.5 text-sm text-gray-100 focus:outline-none focus:border-emerald-500">
                     </label>
                     <div class="sm:col-span-2 flex flex-wrap items-center gap-3">
@@ -1404,7 +1481,7 @@ async def serve_dashboard():
 
                 <details class="mt-6 border-t border-gray-800 pt-4">
                     <summary class="cursor-pointer text-sm font-semibold text-gray-300 hover:text-white">Already have an API key? Check your usage</summary>
-                    <p class="text-xs text-gray-500 mt-3 mb-3">Inspect your plan, rate limit, and remaining monthly requests.</p>
+                    <p class="text-xs text-gray-500 mt-3 mb-3">Inspect your plan, rate limit, and remaining trial requests.</p>
                     <div class="flex flex-col sm:flex-row gap-2">
                         <input id="keyInspectorInput" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste your API key" class="flex-1 bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500 font-mono text-gray-200">
                         <button onclick="inspectApiKey()" class="bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-100 font-semibold px-4 py-2 rounded-lg text-sm">Check usage</button>
@@ -1415,34 +1492,26 @@ async def serve_dashboard():
                         <div><span class="text-gray-500">Company:</span> <b id="statCompany" class="text-white block">-</b></div>
                         <div><span class="text-gray-500">Tier:</span> <b id="statTier" class="text-emerald-400 block">-</b></div>
                         <div><span class="text-gray-500">RPM Limit:</span> <b id="statRpm" class="text-gray-300 block">-</b></div>
-                        <div><span class="text-gray-500">Quota Remaining:</span> <b id="statQuota" class="text-emerald-400 block">-</b></div>
+                        <div><span class="text-gray-500">Trial requests left:</span> <b id="statQuota" class="text-emerald-400 block">-</b></div>
                     </div>
                 </div>
             </section>
 
-            <div class="flex flex-col sm:flex-row gap-2 mb-4">
-                <input id="newTicker" type="text" placeholder="Add Symbol (e.g. INTC, AMZN, PLTR)" 
-                       class="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 uppercase tracking-wider">
-                <button onclick="addCustomTicker()" class="bg-emerald-500 hover:bg-emerald-400 text-black font-bold px-6 py-3 rounded-lg text-sm transition">
-                    + Track
-                </button>
-            </div>
-
             <div class="flex items-end justify-between gap-3 mb-3 px-1">
                 <div>
                     <h2 class="text-lg font-semibold text-gray-100">Market watchlist</h2>
-                    <p class="text-xs text-gray-500 mt-1">Live pricing, momentum and risk signals</p>
+                    <p class="text-xs text-gray-500 mt-1">Public demo snapshots · change is versus prior close except where the source reports 24-hour change</p>
                 </div>
-                <span class="hidden sm:inline-flex items-center gap-2 text-[10px] uppercase tracking-widest text-gray-500"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span> Streaming</span>
+                <span id="watchlistStatus" role="status" aria-live="polite" class="text-[11px] text-gray-400 text-right">Waiting for quotes</span>
             </div>
             <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-2xl">
                 <div class="overflow-x-auto">
-                    <table class="w-full text-left text-sm">
+                    <table class="w-full min-w-[980px] text-left text-sm">
                         <thead class="bg-gray-950 border-b border-gray-800 text-xs text-gray-400 uppercase tracking-wider">
                             <tr>
                                 <th class="py-3.5 px-4">Asset</th>
                                 <th class="py-3.5 px-4">Price</th>
-                                <th class="py-3.5 px-4">24h Change</th>
+                                <th class="py-3.5 px-4">Change</th>
                                 <th class="py-3.5 px-4">50D Avg</th>
                                 <th class="py-3.5 px-4">14D RSI</th>
                                 <th class="py-3.5 px-4">Status</th>
@@ -1458,7 +1527,7 @@ async def serve_dashboard():
 
         <div id="quantModal" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
             <div class="bg-[#0f172a] border border-gray-800 w-full max-w-lg rounded-xl p-6 relative">
-                <button onclick="closeModal()" class="absolute top-4 right-4 text-gray-400 hover:text-white text-lg font-bold">&times;</button>
+                <button onclick="closeModal()" aria-label="Close backtest" class="absolute top-4 right-4 text-gray-400 hover:text-white text-lg font-bold">&times;</button>
                 <div id="modalContent">
                     <p class="text-xs text-gray-500 uppercase tracking-wider">1-year RSI strategy backtest</p>
                     <h3 id="modalTicker" class="text-xl font-bold text-emerald-400 mt-1">--</h3>
@@ -1499,17 +1568,16 @@ async def serve_dashboard():
 
         <script>
             let defaultTickers = [
-                'GRAM-ALTIN-TRY', 'GC=F', 'USDTRY=X',
-                'VUAA.L', 'QQQ', '^GSPC',
-                'NVDA', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'TSLA', 'AMD',
-                'THYAO.IS', 'ASELS.IS', 'EREGL.IS',
-                'MBG.DE', 'BMW.DE',
-                'BTC-USD', 'ETH-USD', 'SOL-USD'
+                'GRAM-ALTIN-TRY', 'USDTRY=X', 'VUAA.L', 'QQQ',
+                'NVDA', 'AAPL', 'THYAO.IS', 'ASELS.IS',
+                'BTC-USD', 'ETH-USD'
             ];
 
             let ws = null;
             let hftWs = null;
             let sessionApiKey = null;
+            let streamReceived = new Set();
+            let streamFailures = 0;
 
             async function requestApiKey(event) {
                 event.preventDefault();
@@ -1593,6 +1661,19 @@ async def serve_dashboard():
                 return Number.isNaN(date.getTime()) ? 'time unavailable' : date.toLocaleTimeString();
             }
 
+            function escapeHtml(value) {
+                return String(value).replace(/[&<>"']/g, char => ({
+                    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+                })[char]);
+            }
+
+            function backtestAction(ticker) {
+                if (ticker === 'GRAM-ALTIN-TRY') {
+                    return '<span class="text-[11px] text-gray-500" title="The available backtest uses gold futures, not a historical gram-gold series">Indicative quote</span>';
+                }
+                return `<button onclick="openQuantModal('${ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2.5 py-1 rounded transition">1Y Backtest</button>`;
+            }
+
             function connectHftWebSocket() {
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 const wsUrl = `${protocol}//${window.location.host}/ws/hft-risk`;
@@ -1600,7 +1681,7 @@ async def serve_dashboard():
 
                 hftWs.onopen = () => {
                     document.getElementById('hftStatus').innerText = 'Waiting for public market quote...';
-                    document.getElementById('hftStatus').className = 'text-[10px] text-emerald-400 font-mono';
+                    document.getElementById('hftStatus').className = 'text-[10px] text-gray-400 font-mono';
                 };
 
                 hftWs.onmessage = (event) => {
@@ -1608,6 +1689,7 @@ async def serve_dashboard():
                     if (d.status !== 'live') {
                         document.getElementById('hftStatus').innerText = d.reason || 'Market quote unavailable';
                         document.getElementById('hftStatus').className = 'text-[10px] text-red-400 font-mono';
+                        document.getElementById('hftDot').className = 'w-2.5 h-2.5 rounded-full bg-red-400';
                         for (const id of ['hftPrice', 'hftVar95', 'hftCvar', 'hftSpread', 'hftOfi']) {
                             document.getElementById(id).innerText = '--';
                         }
@@ -1615,9 +1697,11 @@ async def serve_dashboard():
                     }
                     document.getElementById('hftStatus').innerText = `${d.exchange} · Updated ${formatQuoteTime(d.data_as_of)}`;
                     document.getElementById('hftStatus').className = 'text-[10px] text-emerald-400 font-mono';
+                    document.getElementById('hftDot').className = 'w-2.5 h-2.5 rounded-full bg-emerald-400';
                     document.getElementById('hftPrice').innerText = Number(d.current_price).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-                    document.getElementById('hftVar95').innerText = d.var_95 ? d.var_95.toFixed(2) : '--';
-                    document.getElementById('hftCvar').innerText = d.cvar_95 ? d.cvar_95.toFixed(2) : '--';
+                    const riskPlaceholder = d.risk_status === 'flat_sample' ? 'Flat sample' : `Collecting ${d.sample_count || 0}/15`;
+                    document.getElementById('hftVar95').innerText = Number.isFinite(d.var_95) ? d.var_95.toFixed(2) : riskPlaceholder;
+                    document.getElementById('hftCvar').innerText = Number.isFinite(d.cvar_95) ? d.cvar_95.toFixed(2) : riskPlaceholder;
                     document.getElementById('hftSpread').innerText = Number(d.spread).toFixed(4);
                     document.getElementById('hftOfi').innerText = Number(d.ofi).toFixed(4);
                 };
@@ -1625,6 +1709,10 @@ async def serve_dashboard():
                 hftWs.onclose = () => {
                     document.getElementById('hftStatus').innerText = 'Disconnected. Retrying...';
                     document.getElementById('hftStatus').className = 'text-[10px] text-red-400 font-mono';
+                    document.getElementById('hftDot').className = 'w-2.5 h-2.5 rounded-full bg-red-400';
+                    for (const id of ['hftPrice', 'hftVar95', 'hftCvar', 'hftSpread', 'hftOfi']) {
+                        document.getElementById(id).innerText = '--';
+                    }
                     setTimeout(connectHftWebSocket, 3000);
                 };
             }
@@ -1670,9 +1758,7 @@ async def serve_dashboard():
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-gray-500 text-xs">--</td>
                         <td class="py-3.5 px-4 text-right">
-                            <button onclick="openQuantModal('${ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2.5 py-1 rounded transition">
-                                1Y Backtest
-                            </button>
+                            ${backtestAction(ticker)}
                         </td>
                     `;
                     tbody.appendChild(row);
@@ -1700,7 +1786,7 @@ async def serve_dashboard():
 
                 row.innerHTML = `
                     <td class="py-3.5 px-4 font-bold text-white tracking-wide">${data.ticker}</td>
-                    <td class="py-3.5 px-4 font-semibold text-white">${Number(data.price).toLocaleString(undefined, {maximumFractionDigits: 8})} <span class="text-[10px] text-gray-500">${data.currency}</span><span class="block text-[9px] font-normal text-gray-500" title="${data.quote_source}">${formatQuoteTime(data.data_as_of)} · ${data.quote_source}</span></td>
+                    <td class="py-3.5 px-4 font-semibold text-white">${Number(data.price).toLocaleString(undefined, {maximumFractionDigits: 8})} <span class="text-[10px] text-gray-500">${escapeHtml(data.currency)}</span><span class="block text-[9px] font-normal text-gray-500" title="${escapeHtml(data.quote_source)}">${formatQuoteTime(data.data_as_of)} · ${escapeHtml(data.quote_source)}</span></td>
                     <td class="py-3.5 px-4 font-bold ${changeColor}">${changeSign}${data.change_percent}%</td>
                     <td class="py-3.5 px-4 text-gray-400">${data.fifty_day_average}</td>
                     <td class="py-3.5 px-4">
@@ -1708,11 +1794,24 @@ async def serve_dashboard():
                     </td>
                     <td class="py-3.5 px-4 font-semibold ${statusColor} text-xs">${data.momentum_status}</td>
                     <td class="py-3.5 px-4 text-right">
-                        <button onclick="openQuantModal('${data.ticker}')" class="text-[11px] bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 px-2.5 py-1 rounded transition">
-                            1Y Backtest
-                        </button>
+                        ${backtestAction(data.ticker)}
                     </td>
                 `;
+            }
+
+            function showRowError(ticker) {
+                const row = document.getElementById(`row-${ticker.replace(/[^a-zA-Z0-9]/g, '_')}`);
+                if (!row) return;
+                row.children[1].textContent = 'Quote unavailable · retry refresh';
+                row.children[1].className = 'py-3.5 px-4 text-amber-300 text-xs';
+                for (let index = 2; index <= 5; index++) row.children[index].textContent = '--';
+            }
+
+            function updateWatchlistStatus() {
+                const status = document.getElementById('watchlistStatus');
+                const completed = streamReceived.size;
+                status.textContent = `${completed}/${defaultTickers.length} updated${streamFailures ? ` · ${streamFailures} unavailable` : ''}`;
+                status.className = `text-[11px] text-right ${streamFailures ? 'text-amber-300' : 'text-gray-400'}`;
             }
 
             function connectWebSocket() {
@@ -1723,7 +1822,7 @@ async def serve_dashboard():
                 ws.onopen = () => {
                     const badge = document.getElementById('connBadge');
                     badge.className = 'inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800';
-                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-2"></span> Dashboard connected';
+                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 mr-2"></span> Stream connected';
                     requestStreamAll();
                 };
 
@@ -1731,31 +1830,33 @@ async def serve_dashboard():
                     const response = JSON.parse(event.data);
                     if (response.status === 'success') {
                         updateRowUI(response.data);
+                        streamReceived.add(response.data.ticker);
+                        updateWatchlistStatus();
+                    } else if (response.status === 'error' && response.ticker && defaultTickers.includes(response.ticker)) {
+                        showRowError(response.ticker);
+                        streamReceived.add(response.ticker);
+                        streamFailures += 1;
+                        updateWatchlistStatus();
+                    } else if (response.status === 'error') {
+                        document.getElementById('watchlistStatus').textContent = response.message || 'Stream request failed';
                     }
                 };
 
                 ws.onclose = () => {
                     const badge = document.getElementById('connBadge');
                     badge.className = 'inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-red-950 text-red-400 border border-red-800';
-                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-red-400 mr-2"></span> Disconnected';
+                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-red-400 mr-2"></span> Reconnecting';
+                    document.getElementById('watchlistStatus').textContent = 'Stream disconnected';
                     setTimeout(connectWebSocket, 3000);
                 };
             }
 
             function requestStreamAll() {
                 if (ws && ws.readyState === WebSocket.OPEN) {
+                    streamReceived = new Set();
+                    streamFailures = 0;
+                    document.getElementById('watchlistStatus').textContent = 'Refreshing quotes...';
                     ws.send(JSON.stringify({ tickers: defaultTickers }));
-                }
-            }
-
-            function addCustomTicker() {
-                const input = document.getElementById('newTicker');
-                const val = input.value.trim().toUpperCase();
-                if (val && !defaultTickers.includes(val)) {
-                    defaultTickers.unshift(val);
-                    input.value = '';
-                    initLayout();
-                    requestStreamAll();
                 }
             }
 
@@ -1816,6 +1917,10 @@ async def serve_dashboard():
                 modal.classList.add('hidden');
                 modal.classList.remove('flex');
             }
+
+            document.addEventListener('keydown', event => {
+                if (event.key === 'Escape') closeModal();
+            });
 
             window.onload = () => {
                 initLayout();

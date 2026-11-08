@@ -23,7 +23,7 @@ class ApiClient(Base):
     api_key_hash = Column("api_key", String(128), unique=True, index=True, nullable=False)
     plan_tier = Column(String(32), default="starter")
     rate_limit_per_min = Column(Integer, default=60)
-    monthly_quota = Column(Integer, default=50000)
+    monthly_quota = Column(Integer, default=500)
     used_requests_this_month = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
