@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Developer reference | AlphaMetrics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root{color-scheme:dark;--bg:#111411;--panel:#1a1f1a;--line:#3c453c;--text:#e8ebe3;--muted:#a2aca0;--accent:#dfb872}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 'IBM Plex Sans',sans-serif}
+    a{color:inherit;text-decoration:none}a:hover{color:var(--accent)}a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+    .mono,code,pre,.eyebrow,.method,.nav,.index{font-family:'IBM Plex Mono',monospace}.muted{color:var(--muted)}.accent{color:var(--accent)}
+    .top{border-bottom:1px solid var(--line);padding:20px 34px;display:flex;justify-content:space-between;align-items:center;gap:20px}
+    .identity{display:flex;align-items:center;gap:13px}.mark{display:grid;place-items:center;width:42px;height:42px;border:1px solid var(--accent);color:var(--accent);font:600 11px 'IBM Plex Mono',monospace}
+    .identity b{display:block;font-size:17px;letter-spacing:-.025em;line-height:1.15}.identity small{display:block;margin-top:4px;color:var(--muted);font:10px 'IBM Plex Mono',monospace;letter-spacing:.07em;text-transform:uppercase}
+    .toplinks{display:flex;gap:22px;font-size:12px}.layout{max-width:1440px;margin:auto;display:grid;grid-template-columns:230px minmax(0,1fr) 220px;min-height:calc(100vh - 83px)}
+    .side{border-right:1px solid var(--line);padding:35px 22px 35px 34px}.side-inner{position:sticky;top:28px}.nav-label,.eyebrow{color:var(--accent);font-size:10px;letter-spacing:.12em;text-transform:uppercase;font-weight:600}.nav-label{margin:0 0 15px}.nav a{display:block;padding:9px 0;color:var(--muted);font-size:11px;border-bottom:1px solid #2d352d}.nav a:hover{color:var(--text)}
+    main{min-width:0;padding:34px clamp(24px,5vw,72px) 90px}.intro{border-bottom:1px solid var(--line);padding-bottom:33px}.intro h1{font-size:clamp(38px,5vw,66px);line-height:1.05;letter-spacing:-.045em;font-weight:600;margin:14px 0 16px}.intro p{max-width:720px;color:var(--muted);font-size:15px;line-height:1.7;margin:0}
+    .facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border:1px solid var(--line);margin:28px 0 0}.fact{padding:16px;border-right:1px solid var(--line)}.fact:last-child{border-right:0}.fact span{display:block;color:var(--muted);font:10px 'IBM Plex Mono',monospace;text-transform:uppercase}.fact strong{display:block;margin-top:7px;font:500 13px 'IBM Plex Mono',monospace}
+    .doc-section{scroll-margin-top:20px;padding-top:34px;border-bottom:1px solid var(--line);padding-bottom:36px}.doc-section h2{font-size:24px;letter-spacing:-.025em;font-weight:600;margin:7px 0 12px}.doc-section p{color:var(--muted);margin:0 0 16px;max-width:720px}.number{color:var(--accent);font:11px 'IBM Plex Mono',monospace}
+    .step-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border:1px solid var(--line);margin:21px 0}.step{padding:18px;border-right:1px solid var(--line)}.step:last-child{border-right:0}.step b{display:block;margin:8px 0;font-size:13px}.step small{display:block;color:var(--muted);font-size:12px;line-height:1.55}
+    .codebox{background:#151a15;border:1px solid var(--line);margin:18px 0}.codehead{display:flex;justify-content:space-between;align-items:center;padding:8px 14px;border-bottom:1px solid var(--line);font:10px 'IBM Plex Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}.codehead button{border:0;background:transparent;color:var(--accent);font:inherit;cursor:pointer;padding:4px}.codehead button:hover{text-decoration:underline}pre{margin:0;overflow:auto;padding:18px;font-size:12px;line-height:1.8;color:#e5e8db}pre .accent{color:var(--accent)}
+    .endpoint{display:grid;grid-template-columns:70px minmax(0,1fr);gap:4px 14px;padding:15px 0;border-top:1px solid var(--line)}.endpoint:first-of-type{margin-top:20px}.method{font-size:11px;font-weight:600;color:var(--accent)}.endpoint code{font-size:12px;overflow-wrap:anywhere}.endpoint p{grid-column:2;font-size:12px;margin:0}.endpoint .method.post{color:#a9c8aa}
+    .note{border-left:2px solid var(--accent);padding:10px 15px;background:#1d221c;color:var(--muted);font-size:12px;margin-top:20px}.note b{color:var(--text)}
+    .rail{border-left:1px solid var(--line);padding:36px 24px}.rail-inner{position:sticky;top:28px}.rail h3{font:600 10px 'IBM Plex Mono',monospace;letter-spacing:.12em;color:var(--accent);text-transform:uppercase;margin:0 0 18px}.rail p{color:var(--muted);font-size:12px;margin:0 0 17px}.rail a{display:block;border:1px solid var(--line);padding:10px 12px;font-size:11px;margin-bottom:8px}.rail a:hover{border-color:var(--accent)}
+    @media(max-width:1050px){.layout{grid-template-columns:190px minmax(0,1fr)}.rail{display:none}.side{padding-left:24px}}
+    @media(max-width:700px){.top{padding:16px 20px}.toplinks{gap:12px}.layout{display:block}.side{border:0;border-bottom:1px solid var(--line);padding:12px 20px}.side-inner{position:static}.side .nav-label{display:none}.nav{display:flex;gap:16px;overflow:auto;white-space:nowrap}.nav a{border:0;padding:3px 0}main{padding:26px 20px 70px}.facts,.step-grid{grid-template-columns:1fr}.fact,.step{border-right:0;border-bottom:1px solid var(--line)}.fact:last-child,.step:last-child{border-bottom:0}}
+  </style>
+</head>
+<body>
+  <header class="top">
+    <div class="identity"><span class="mark">AM/</span><div><b>Alpha<span class="accent">Metrics</span></b><small>Developer reference / v1</small></div></div>
+    <div class="toplinks"><a href="/">← Dashboard</a><a href="/reference">Interactive API ↗</a></div>
+  </header>
+  <div class="layout">
+    <aside class="side"><div class="side-inner"><p class="nav-label">Contents</p><nav class="nav" aria-label="Documentation"><a href="#overview">Overview</a><a href="#access">Get access</a><a href="#authentication">Authentication</a><a href="#endpoints">Endpoints</a><a href="#limits">Limits &amp; data</a></nav></div></aside>
+    <main>
+      <div id="overview" class="intro"><span class="eyebrow">API / 01 · Research access</span><h1>Build with<br><span class="accent">market context.</span></h1><p>Query public market snapshots and quantitative research outputs from a small, inspectable API. This reference shows the working routes and how to authenticate. The interactive OpenAPI explorer is available separately.</p>
+        <div class="facts"><div class="fact"><span>Base path</span><strong>/api/v1</strong></div><div class="fact"><span>Transport</span><strong>HTTPS + JSON</strong></div><div class="fact"><span>Trial</span><strong>500 requests total</strong></div></div>
+      </div>
+      <section id="access" class="doc-section"><span class="number">01 / ACCESS</span><h2>Get a Starter key</h2><p>Create a trial client from the <a class="accent" href="/#api-access">API access form on the dashboard ↗</a>. Verify your email, then copy the key when it appears. It is shown once.</p>
+        <div class="step-grid"><div class="step"><span class="number">01</span><b>Register</b><small>Submit your company or project name and email.</small></div><div class="step"><span class="number">02</span><b>Verify</b><small>Use the code sent to your inbox within 15 minutes.</small></div><div class="step"><span class="number">03</span><b>Store the key</b><small>Save the returned key securely. The dashboard will not show it again.</small></div></div>
+        <p>For programmatic registration, use <code>POST /api/v1/auth/register</code> with <code>company_name</code> and <code>email</code>, followed by <code>POST /api/v1/auth/verify-email</code> with <code>email</code> and <code>token</code>. See exact schemas in the <a class="accent" href="/reference">interactive API ↗</a>.</p>
+      </section>
+      <section id="authentication" class="doc-section"><span class="number">02 / AUTHENTICATION</span><h2>Send your key in a header</h2><p>Authenticated endpoints expect an <code>X-API-Key</code> request header. Keep the key on your server; do not embed it in public browser code or a repository.</p>
+        <div class="codebox"><div class="codehead"><span>Example · market metric</span><button type="button" data-copy="metric">Copy</button></div><pre id="metric">curl -H "X-API-Key: YOUR_API_KEY" \
+  "https://alpha-metrics-engine.onrender.com/api/v1/metrics/BTCUSDT"</pre></div>
+        <p>To inspect your allowance, call <code>GET /api/v1/auth/usage</code> with the same header, or use the <a class="accent" href="/#api-access">key checker on the dashboard ↗</a>. The checker does not store your key between visits.</p>
+      </section>
+      <section id="endpoints" class="doc-section"><span class="number">03 / ENDPOINTS</span><h2>Available routes</h2><p>Use the interactive explorer for query parameters, request bodies, and response schemas.</p>
+        <div class="endpoint"><span class="method">GET</span><code>/api/v1/metrics/{ticker}</code><p>Price, change, RSI, moving average, and momentum status. API key required.</p></div>
+        <div class="endpoint"><span class="method">GET</span><code>/api/v1/quant/backtest/{ticker}</code><p>One-year RSI backtest result. API key required.</p></div>
+        <div class="endpoint"><span class="method">GET</span><code>/api/v1/quant/var/{ticker}</code><p>Monte Carlo VaR and CVaR. API key required; <code>days</code> and <code>simulations</code> are optional.</p></div>
+        <div class="endpoint"><span class="method">GET</span><code>/api/v1/quant/correlation?symbols=AAPL,TSLA</code><p>Correlation matrix for 2–12 distinct symbols. API key required.</p></div>
+        <div class="endpoint"><span class="method">GET</span><code>/api/v1/auth/usage</code><p>Current plan, rate limit, and remaining trial requests. API key required.</p></div>
+        <div class="endpoint"><span class="method">GET</span><code>/api/v1/demo/quant/backtest/{ticker}</code><p>Rate-limited public route for supported dashboard symbols.</p></div>
+        <div class="endpoint"><span class="method post">WS</span><code>/ws/stream · /ws/hft-risk</code><p>Public market and risk streams used by the dashboard. Availability depends on upstream feeds.</p></div>
+        <div class="codebox"><div class="codehead"><span>Example · portfolio correlation</span><button type="button" data-copy="corr">Copy</button></div><pre id="corr">curl -H "X-API-Key: YOUR_API_KEY" \
+  "https://alpha-metrics-engine.onrender.com/api/v1/quant/correlation?symbols=AAPL,TSLA"</pre></div>
+      </section>
+      <section id="limits" class="doc-section"><span class="number">04 / OPERATING NOTES</span><h2>Limits &amp; data</h2><p>The Starter trial includes 500 requests total and a limit of 60 requests per minute. The current allowance does not automatically reset each month. Exceeding a rate limit returns HTTP 429; upstream market failures may return HTTP 502.</p>
+        <div class="note"><b>Research data.</b> Quotes and history come from public exchange and Yahoo Finance sources. Availability, latency, and usage rights depend on those providers. Treat analytical outputs as research examples, not investment advice.</div>
+      </section>
+    </main>
+    <aside class="rail"><div class="rail-inner"><h3>Working links</h3><p>Start with the dashboard for a key, then use the API explorer to inspect live request and response schemas.</p><a href="/#api-access">Get or check a key ↗</a><a href="/reference">Open interactive API ↗</a><a href="/openapi.json">OpenAPI JSON ↗</a></div></aside>
+  </div>
+  <script>
+    document.querySelectorAll('[data-copy]').forEach(button=>button.addEventListener('click',async()=>{
+      const value=document.getElementById(button.dataset.copy).textContent;
+      try{await navigator.clipboard.writeText(value);button.textContent='Copied';setTimeout(()=>button.textContent='Copy',1800)}
+      catch{button.textContent='Select text to copy';setTimeout(()=>button.textContent='Copy',2500)}
+    }));
+  </script>
+</body>
+</html>

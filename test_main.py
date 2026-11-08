@@ -14,6 +14,15 @@ def test_root_dashboard_html():
     response = client.get("/")
     assert response.status_code == 200
 
+def test_developer_docs_and_interactive_reference():
+    docs = client.get("/docs")
+    assert docs.status_code == 200
+    assert "Developer reference" in docs.text
+    assert "500 requests total" in docs.text
+    reference = client.get("/reference")
+    assert reference.status_code == 200
+    assert "swagger-ui" in reference.text
+
 def test_api_key_generation_format():
     key = generate_api_key("enterprise")
     assert key.startswith("am_enterprise_")

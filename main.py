@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import re
 import secrets
 import smtplib
@@ -249,7 +250,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AlphaMetrics Financial Intelligence API",
     version="4.0.0",
-    docs_url="/docs",
+    docs_url="/reference",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     lifespan=lifespan,
@@ -285,7 +286,7 @@ async def security_headers_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    if request.url.path in ["/health", "/docs", "/openapi.json", "/", "/api/v1/billing/webhook"]:
+    if request.url.path in ["/health", "/docs", "/reference", "/openapi.json", "/", "/api/v1/billing/webhook"]:
         return await call_next(request)
 
     client_ip = request.client.host if request.client else "unknown"
@@ -1300,6 +1301,11 @@ async def websocket_hft_risk_endpoint(websocket: WebSocket):
     except Exception:
         engine_mem.unsubscribe_hft(queue)
 
+@app.get("/docs", response_class=HTMLResponse, include_in_schema=False)
+async def serve_documentation():
+    return Path(__file__).with_name("developer_docs.html").read_text(encoding="utf-8")
+
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
     return """
@@ -1310,66 +1316,108 @@ async def serve_dashboard():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>AlphaMetrics | Market Risk Research API</title>
         <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
         <style>
             :root {
                 color-scheme: dark;
-                --canvas: #080b12;
-                --panel: rgba(15, 20, 31, .88);
-                --line: rgba(148, 163, 184, .13);
-                --muted: #8993a5;
-                --mint: #67e8bd;
+                --canvas: #111411;
+                --panel: #1a1f1a;
+                --line: #3c453c;
+                --muted: #a2aca0;
+                --accent: #dfb872;
             }
             * { box-sizing: border-box; }
             body {
-                font-family: 'DM Sans', sans-serif;
-                background: radial-gradient(ellipse at 50% -18%, rgba(16, 185, 129, .13), transparent 40%),
-                            radial-gradient(ellipse at 100% 45%, rgba(56, 189, 248, .045), transparent 34%), var(--canvas);
-                color: #e8edf5;
-                letter-spacing: -.01em;
+                font-family: 'IBM Plex Sans', sans-serif;
+                background: var(--canvas);
+                color: #e8ebe3;
+                letter-spacing: 0;
             }
-            body::before {
-                content: ''; position: fixed; inset: 0; pointer-events: none; opacity: .14;
-                background-image: linear-gradient(rgba(148,163,184,.045) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,.045) 1px, transparent 1px);
-                background-size: 48px 48px; mask-image: linear-gradient(to bottom, black, transparent 80%);
-            }
-            .max-w-5xl { max-width: 1280px; position: relative; }
-            h1, h2, h3 { letter-spacing: -.045em; }
-            section, .bg-gray-900.border, #quantModal > div {
-                backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
-                box-shadow: 0 18px 60px rgba(0,0,0,.24);
-            }
-            section:first-of-type { background: linear-gradient(120deg, rgba(16, 35, 35, .92), rgba(13, 19, 29, .9) 64%, rgba(11, 23, 29, .92)); }
-            section:nth-of-type(2) { background: linear-gradient(135deg, rgba(17, 23, 35, .92), rgba(12, 17, 27, .88)); }
-            .hero { background: linear-gradient(120deg, rgba(16, 35, 35, .92), rgba(13, 19, 29, .94) 64%, rgba(11, 23, 29, .92)); }
-            #watchlistBody tr { transition: background .18s ease, transform .18s ease; }
-            #watchlistBody tr:hover { background: rgba(103, 232, 189, .045); }
-            thead th { font-size: 10px; letter-spacing: .12em; white-space: nowrap; }
-            input { transition: border-color .18s ease, box-shadow .18s ease; }
-            input:focus { box-shadow: 0 0 0 3px rgba(103, 232, 189, .1); }
-            button { transition: transform .16s ease, background-color .16s ease, border-color .16s ease, box-shadow .16s ease; }
-            button:hover { transform: translateY(-1px); }
-            button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; }
-            #quantModal > div { background: rgba(13, 19, 30, .97); }
-            @media (prefers-reduced-motion: reduce) {
-                *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
-            }
+            .max-w-5xl { max-width: 1180px; }
+            h1, h2, h3 { letter-spacing: -.025em; }
+            .font-mono, code, thead th, .eyebrow, .hero-index, #connBadge { font-family: 'IBM Plex Mono', monospace !important; }
+            .site-header { border-color: var(--line); }
+            .brand-mark { width: 44px; height: 44px; display: grid; place-items: center; border: 1px solid var(--accent); color: var(--accent); font: 600 12px 'IBM Plex Mono',monospace; }
+            .brand-accent, .eyebrow, .text-link { color: var(--accent) !important; }
+            .eyebrow { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; font-weight: 600; }
+            .site-nav { border-bottom: 1px solid var(--line); padding-bottom: 15px; }
+            .site-nav a:hover, .text-link:hover { color: #f7d9a2 !important; text-decoration: underline; text-underline-offset: 4px; }
+            section, .watchlist-shell, #quantModal > div { background: var(--panel) !important; border: 1px solid var(--line) !important; border-radius: 2px !important; box-shadow: none !important; backdrop-filter: none !important; }
+            .hero { padding: 0 !important; }
+            .hero-topline { display: flex; justify-content: space-between; gap: 16px; padding: 14px 24px; border-bottom: 1px solid var(--line); }
+            .hero-grid { display: grid; grid-template-columns: minmax(0,1.4fr) minmax(260px,.6fr); }
+            .hero-copy { padding: 34px 30px 30px; }
+            .hero-copy h2 { font-size: clamp(32px,4.3vw,58px); line-height: 1.05; max-width: 720px; font-weight: 600; }
+            .hero-index { border-left: 1px solid var(--line); }
+            .feature-row { padding: 21px 22px; border-bottom: 1px solid var(--line); }
+            .feature-row:last-child { border-bottom: 0; }
+            .feature-row span { color: var(--accent); font-size: 10px; display: block; margin-bottom: 9px; }
+            .feature-row b { display: block; font-size: 13px; color: #f1f2ec; margin-bottom: 5px; }
+            .feature-row small { display: block; font: 11px/1.5 'IBM Plex Sans',sans-serif; color: var(--muted); }
+            .source-note { border-top: 1px solid var(--line); padding: 14px 24px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+            .primary-action { background: var(--accent) !important; color: #1b1a14 !important; border: 1px solid var(--accent) !important; font-weight: 700; }
+            .primary-action:hover { background: #f4d39a !important; }
+            .secondary-action { border: 1px solid var(--line) !important; color: #e7e9e1 !important; background: transparent !important; }
+            .secondary-action:hover { border-color: var(--accent) !important; color: var(--accent) !important; }
+            #connBadge { border: 1px solid var(--line) !important; background: transparent !important; border-radius: 2px !important; color: #d2d8ce !important; font-weight: 500; }
+            #connBadge > span, #hftDot { border-radius: 50% !important; }
+            .metrics-grid { gap: 0 !important; border: 1px solid var(--line); }
+            .metric-cell { border: 0 !important; border-right: 1px solid var(--line) !important; border-radius: 0 !important; background: #151a15 !important; min-height: 76px; }
+            .metric-cell:last-child { border-right: 0 !important; }
+            .metric-cell span { color: var(--muted) !important; letter-spacing: .08em; }
+            .metric-cell b { display: block; margin-top: 8px; font-size: 15px; }
+            #market .text-emerald-300, #api-access .text-emerald-300 { color: var(--accent) !important; }
+            #market .text-emerald-400, #api-access .text-emerald-400 { color: #d4dcb5 !important; }
+            #api-access input, #api-access form > div > div, #api-access #inspectorResult, #api-access #verifyForm, #api-access #apiKeyResult { background: #141814 !important; border-color: var(--line) !important; border-radius: 2px !important; }
+            #api-access #inspectorResult > div .rounded-lg { background: #1d231d !important; border-color: var(--line) !important; border-radius: 2px !important; }
+            #api-access #statStatus { border-radius: 2px !important; background: #283328 !important; border-color: #52654e !important; }
+            #api-access #usageProgress, #api-access #usageProgressFill { border-radius: 0 !important; }
+            #api-access #usageProgressFill { background: var(--accent) !important; }
+            .watchlist-shell thead { background: #151a15 !important; border-color: var(--line) !important; }
+            .watchlist-shell thead th { font: 600 10px 'IBM Plex Mono',monospace; letter-spacing: .08em; white-space: nowrap; color: var(--muted); }
+            #watchlistBody tr { border-color: var(--line) !important; }
+            #watchlistBody tr:hover { background: #242c24; }
+            #watchlistBody td { font-family: 'IBM Plex Mono',monospace; font-size: 12px; }
+            #watchlistBody td:first-child { font-family: 'IBM Plex Sans',sans-serif; }
+            #watchlistBody .rounded { border-radius: 0 !important; background: transparent !important; border-color: var(--line) !important; }
+            #watchlistBody button.rounded { color: var(--accent) !important; padding: 5px 9px; }
+            #watchlistBody button.rounded:hover { border-color: var(--accent) !important; }
+            #watchlistBody .text-blue-400 { color: #afc3d4 !important; }
+            #watchlistBody .text-emerald-400 { color: #a6c4a5 !important; }
+            #watchlistBody .text-red-400 { color: #d7a49b !important; }
+            #quantModal > div { background: #1a1f1a !important; }
+            #quantModal .bg-gray-900 { background: #151a15 !important; border-color: var(--line) !important; border-radius: 0 !important; }
+            #quantModal .text-emerald-400, #quantModal .text-emerald-300 { color: var(--accent) !important; }
+            input:focus { border-color: var(--accent) !important; outline: none; box-shadow: none !important; }
+            button, input, a { transition: none !important; }
+            button:hover { transform: none !important; }
+            button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
             @media (max-width: 640px) {
                 body { padding: 18px !important; }
                 section { padding: 16px !important; }
+                .hero { padding: 0 !important; }
+                .hero-grid { grid-template-columns: 1fr; }
+                .hero-copy { padding: 26px 20px; }
+                .hero-topline { padding: 12px 20px; }
+                .hero-topline span:last-child { display: none; }
+                .hero-index { border-left: 0; border-top: 1px solid var(--line); }
+                .feature-row { padding: 14px 20px; }
+                .metrics-grid { grid-template-columns: repeat(2,minmax(0,1fr)) !important; }
+                .metric-cell { border-bottom: 1px solid var(--line) !important; }
+                .metric-cell:nth-child(2n) { border-right: 0 !important; }
                 #watchlistBody td, thead th { padding-left: 12px; padding-right: 12px; }
             }
         </style>
     </head>
     <body class="min-h-screen p-4 sm:p-8 flex justify-center">
         <div class="w-full max-w-5xl">
-            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-800/80 pb-6 mb-7">
+            <div class="site-header flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b pb-5 mb-5">
                 <div>
                     <div class="flex items-center gap-3">
-                        <span class="flex h-10 w-10 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-emerald-300 text-lg font-bold">α</span>
+                        <span class="brand-mark">AM/</span>
                         <div>
-                            <h1 class="text-2xl font-bold text-white">Alpha<span class="text-emerald-300">Metrics</span></h1>
-                            <p class="text-xs text-gray-500 mt-1">Market risk research API <span class="mx-1 text-gray-700">/</span> Tarn Dynamics</p>
+                            <h1 class="text-xl font-semibold text-white">Alpha<span class="brand-accent">Metrics</span></h1>
+                            <p class="eyebrow mt-1" style="color:var(--muted)!important;letter-spacing:.08em">Market intelligence / Tarn Dynamics</p>
                         </div>
                     </div>
                 </div>
@@ -1377,76 +1425,78 @@ async def serve_dashboard():
                     <span id="connBadge" role="status" aria-live="polite" class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-gray-900 text-gray-400 border border-gray-700">
                         <span class="w-2 h-2 rounded-full bg-gray-400 mr-2"></span> Connecting
                     </span>
-                    <button onclick="requestStreamAll()" class="bg-gray-900 border border-gray-700 hover:border-gray-500 text-xs px-3 py-1.5 rounded-lg text-gray-300 transition">
+                    <button onclick="requestStreamAll()" class="secondary-action text-xs px-3 py-1.5">
                         Refresh quotes
                     </button>
                 </div>
             </div>
 
-            <nav aria-label="Main navigation" class="flex flex-wrap items-center gap-x-5 gap-y-2 mb-6 text-sm text-gray-400">
+            <nav aria-label="Main navigation" class="site-nav flex flex-wrap items-center gap-x-6 gap-y-2 mb-6 text-xs text-gray-400">
                 <a class="hover:text-white" href="#market">Live market</a>
                 <a class="hover:text-white" href="#api-access">API access</a>
                 <a class="hover:text-white" href="/docs">Documentation</a>
             </nav>
 
-            <section class="hero border border-emerald-500/20 rounded-2xl p-6 sm:p-9 mb-6">
-                <div class="max-w-3xl">
-                    <span class="inline-flex items-center rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1 text-xs font-semibold text-emerald-300">Market data · risk analytics · developer API</span>
-                    <h2 class="mt-4 text-3xl sm:text-4xl font-bold leading-tight text-white">Market data and risk models you can inspect and integrate.</h2>
-                    <p class="mt-3 max-w-2xl text-sm sm:text-base leading-7 text-gray-400">Explore public market snapshots, review quantitative outputs, and test the API with a free Starter key.</p>
-                    <div class="mt-6 flex flex-wrap gap-3">
-                        <a href="#api-access" class="rounded-lg bg-emerald-400 px-4 py-2.5 text-sm font-bold text-gray-950 hover:bg-emerald-300">Get a free API key</a>
-                        <a href="/docs" class="rounded-lg border border-gray-700 px-4 py-2.5 text-sm font-semibold text-gray-200 hover:border-gray-500">Explore API docs</a>
-                        <a href="mailto:aybarsduran30@gmail.com?subject=AlphaMetrics%20pilot" class="rounded-lg border border-gray-700 px-4 py-2.5 text-sm font-semibold text-gray-200 hover:border-gray-500">Discuss a pilot</a>
+            <section class="hero mb-6">
+                <div class="hero-topline eyebrow"><span>01 / Market research system</span><span>Public build · 2026</span></div>
+                <div class="hero-grid">
+                    <div class="hero-copy">
+                        <h2>Market data.<br><span class="brand-accent">Risk in context.</span></h2>
+                        <p class="mt-5 max-w-xl text-sm leading-7 text-gray-400">A compact research workspace for public market snapshots, quantitative risk outputs, and a developer API you can inspect.</p>
+                        <div class="mt-7 flex flex-wrap gap-2">
+                            <a href="#api-access" class="primary-action px-4 py-2.5 text-sm">Get a free API key</a>
+                            <a href="/docs" class="secondary-action px-4 py-2.5 text-sm">Read the API docs ↗</a>
+                            <a href="mailto:aybarsduran30@gmail.com?subject=AlphaMetrics%20pilot" class="secondary-action px-4 py-2.5 text-sm">Discuss a pilot</a>
+                        </div>
                     </div>
-                    <div class="mt-6 grid gap-3 sm:grid-cols-3 text-xs text-gray-300">
-                        <div class="rounded-lg border border-emerald-500/15 bg-gray-950/40 p-3"><b class="block text-emerald-300">Risk estimates</b><span class="mt-1 block text-gray-400">VaR and expected shortfall from historical data.</span></div>
-                        <div class="rounded-lg border border-emerald-500/15 bg-gray-950/40 p-3"><b class="block text-emerald-300">Portfolio context</b><span class="mt-1 block text-gray-400">Cross-asset correlation for a selected basket.</span></div>
-                        <div class="rounded-lg border border-emerald-500/15 bg-gray-950/40 p-3"><b class="block text-emerald-300">Strategy checks</b><span class="mt-1 block text-gray-400">A reproducible one-year RSI backtest.</span></div>
+                    <div class="hero-index" aria-label="Research modules">
+                        <div class="feature-row"><span>01 / RISK</span><b>Historical estimates</b><small>VaR and expected shortfall from market history.</small></div>
+                        <div class="feature-row"><span>02 / PORTFOLIO</span><b>Cross-asset context</b><small>Correlation for a selected basket of instruments.</small></div>
+                        <div class="feature-row"><span>03 / STRATEGY</span><b>Backtest checks</b><small>A reproducible one-year RSI study.</small></div>
                     </div>
-                    <p class="mt-4 text-xs leading-5 text-gray-500">Public demo data only. BTC/USDT top-of-book data comes from the exchange named in the live feed; watchlist quotes use public exchange and Yahoo Finance data. This is a research and engineering demo, not investment advice.</p>
                 </div>
+                <p class="source-note">RESEARCH BUILD / BTC/USDT top-of-book data comes from the exchange named in the live feed. Watchlist quotes use public exchange and Yahoo Finance data. Outputs are for engineering evaluation, not investment advice.</p>
             </section>
 
-            <section id="market" class="bg-gray-900/80 border border-emerald-500/30 rounded-xl p-5 mb-6 shadow-2xl relative overflow-hidden">
+            <section id="market" class="p-5 mb-6 relative overflow-hidden">
                 <div class="flex items-center justify-between mb-3 border-b border-gray-800/80 pb-2">
                     <div class="flex items-center gap-2">
                         <span id="hftDot" class="w-2.5 h-2.5 rounded-full bg-gray-500"></span>
-                        <span class="text-xs font-bold uppercase tracking-wider text-emerald-300">BTC/USDT <span class="text-gray-500">/</span> Live market feed</span>
+                        <span class="eyebrow">BTC/USDT <span class="text-gray-500">/</span> Live market feed</span>
                     </div>
                     <span id="hftStatus" class="text-[10px] text-gray-400 font-mono">Connecting to public order book...</span>
                 </div>
-                <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
-                    <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
+                <div class="metrics-grid grid grid-cols-2 sm:grid-cols-5">
+                    <div class="metric-cell p-3">
                             <span class="text-[10px] text-gray-500 uppercase block">BTC / USDT mid</span>
                         <b id="hftPrice" class="text-sm text-white font-mono">--</b>
                     </div>
-                    <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
+                    <div class="metric-cell p-3">
                             <span class="text-[10px] text-gray-500 uppercase block">10-snapshot VaR 95%</span>
                         <b id="hftVar95" class="text-sm text-amber-400 font-mono">--</b>
                     </div>
-                    <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
+                    <div class="metric-cell p-3">
                         <span class="text-[10px] text-gray-500 uppercase block">CVaR (Shortfall)</span>
                         <b id="hftCvar" class="text-sm text-red-400 font-mono">--</b>
                     </div>
-                    <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
+                    <div class="metric-cell p-3">
                             <span class="text-[10px] text-gray-500 uppercase block">Best bid/ask spread</span>
                         <b id="hftSpread" class="text-sm text-emerald-400 font-mono">--</b>
                     </div>
-                    <div class="bg-gray-950/70 p-3 rounded-lg border border-gray-800">
+                    <div class="metric-cell p-3">
                             <span class="text-[10px] text-gray-500 uppercase block">Top-book imbalance</span>
                         <b id="hftOfi" class="text-sm text-cyan-400 font-mono">--</b>
                     </div>
                 </div>
             </section>
 
-            <section id="api-access" class="bg-gray-900/60 border border-gray-800 rounded-xl p-5 mb-6 shadow-xl">
+            <section id="api-access" class="p-5 mb-6">
                 <div class="flex items-center justify-between mb-3">
                     <div>
-                        <span class="text-xs font-bold uppercase tracking-wider text-emerald-300">Start building</span>
+                        <span class="eyebrow">02 / Developer access</span>
                         <h2 class="mt-1 text-xl font-semibold text-white">Get your Starter API key</h2>
                     </div>
-                    <a href="/docs" class="text-xs text-emerald-300 hover:text-emerald-200">Read API docs ↗</a>
+                    <a href="/docs" class="text-link text-xs">Read API docs ↗</a>
                 </div>
                 <p class="text-sm text-gray-400 mb-5">Verify your email to create a trial client. Your API key is shown once, after verification.</p>
                 <form id="signupForm" onsubmit="requestApiKey(event)" class="grid gap-3 sm:grid-cols-2">
@@ -1457,7 +1507,7 @@ async def serve_dashboard():
                         <input id="signupEmail" required type="email" maxlength="100" autocomplete="email" placeholder="you@company.com" class="mt-1 w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2.5 text-sm text-gray-100 focus:outline-none focus:border-emerald-500">
                     </label>
                     <div class="sm:col-span-2 flex flex-wrap items-center gap-3">
-                        <button id="signupButton" type="submit" class="rounded-lg bg-emerald-400 px-4 py-2.5 text-sm font-bold text-gray-950 hover:bg-emerald-300">Send verification code</button>
+                        <button id="signupButton" type="submit" class="primary-action px-4 py-2.5 text-sm">Send verification code</button>
                         <p id="signupStatus" role="status" aria-live="polite" class="text-sm text-gray-400"></p>
                     </div>
                 </form>
@@ -1465,7 +1515,7 @@ async def serve_dashboard():
                     <p class="text-sm text-gray-300">Enter the code sent to <b id="verificationEmail" class="text-white"></b>.</p>
                     <div class="mt-3 flex flex-col gap-2 sm:flex-row">
                         <input id="verificationCode" required autocomplete="one-time-code" inputmode="text" placeholder="Verification code" class="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-3 py-2.5 text-sm font-mono text-gray-100 focus:outline-none focus:border-emerald-500">
-                        <button id="verifyButton" type="submit" class="rounded-lg bg-emerald-400 px-4 py-2.5 text-sm font-bold text-gray-950 hover:bg-emerald-300">Verify email</button>
+                        <button id="verifyButton" type="submit" class="primary-action px-4 py-2.5 text-sm">Verify email</button>
                     </div>
                     <p id="verifyStatus" role="status" aria-live="polite" class="mt-2 text-sm text-gray-400"></p>
                 </form>
@@ -1504,7 +1554,7 @@ async def serve_dashboard():
                 </div>
                 <span id="watchlistStatus" role="status" aria-live="polite" class="text-[11px] text-gray-400 text-right">Waiting for quotes</span>
             </div>
-            <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-2xl">
+            <div class="watchlist-shell overflow-hidden">
                 <div class="overflow-x-auto">
                     <table class="w-full min-w-[980px] text-left text-sm">
                         <thead class="bg-gray-950 border-b border-gray-800 text-xs text-gray-400 uppercase tracking-wider">
